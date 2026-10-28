@@ -1,0 +1,22 @@
+{
+  "name": "product-center-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "database.hostname": "mysql",
+    "database.port": "3306",
+    "database.user": "debezium",
+    "database.password": "dbz123456",
+    "database.server.id": "54001",
+    "database.include.list": "demo",
+    "table.include.list": "demo.category,demo.attribute_meta,demo.spu,demo.sku",
+    "topic.prefix": "demo",
+    "schema.history.internal.kafka.topic": "schema-history",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "decimal.handling.mode": "double",
+    "snapshot.mode": "initial",
+    "transforms": "route",
+    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
+    "transforms.route.regex": "demo.demo.(category|attribute_meta|spu|sku)",
+    "transforms.route.replacement": "product.changed"
+  }
+}
