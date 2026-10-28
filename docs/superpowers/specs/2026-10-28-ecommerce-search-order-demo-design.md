@@ -1,59 +1,65 @@
-# 电商「搜索 + 订单」故障演练场 — 设计文档 v2
+# 电商「商品中心 + 订单」故障演练场 — 设计文档 v3
 
 日期：2026-10-28
-状态：v2（按学习目标对齐后），待用户审阅
+状态：v3（业务锚点升级为「商品中心」场景题），待用户审阅
 
 ## 变更记录
 
-- v1 → v2：新增订单状态机（下单/支付/超时/取消/崩溃演练）；新增数据生成与规模设计（zipf 分布、百万级、突发流量）；新增 Redis 手搓布隆过滤器设计；新增 MySQL 性能优化 Lab；新增「环境搭建」「MySQL 性能」「业务架构」三类 bug（总数 26 → 41）；新增硬件极限说明、参数手册约定、学习材料计划、kafka-inspector 工具、chaos 脚本。
+- v1 → v2：订单状态机、zipf 造数、布隆过滤器、MySQL 性能 Lab、41 个 bug、参数手册约定。
+- v2 → v3：**业务锚点升级**——以场景题《淘宝商品如何支持几十种商品类型（SPU/SKU/类目/动态属性）》为核心：SPU/SKU 两层建模、属性元数据驱动、JSON 异构属性、可检索属性倒排化（ES + MySQL 倒排表双实现）、热点库存 Redis 预扣（演进）、三态库存、Redis 挂三道防线、发布幂等、ZSET 榜单；bug 数 41 → **50**。
 
 ## 1. 目标与背景
 
-**一句话**：用 Go + MySQL + CDC(Debezium) + Kafka + ES + Redis 搭一个贴近真实生产的电商 demo，内置 41 个可人为注入的生产故障，配合造数/压测/混沌工具，在"模拟生产环境"中完成从理论理解到手动保障稳定性的完整训练。
+**一句话**：以「商品中心」场景题为业务内核，用 Go + MySQL + CDC(Debezium) + Kafka + ES + Redis 搭一个贴近真实生产的电商 demo，内置 50 个可人为注入的生产故障，配合造数/压测/混沌工具，在模拟生产环境中完成从理论到手动保障稳定性的训练。
+
+**业务锚点**（`Desktop\learn\场景题-系统设计\01-商品中心.md`）一句话总纲：**核心代码只认「属性元数据」，不认「具体属性」**——类目/属性/SPU/SKU 拆成「关系表骨架 + JSON 异构属性 + 元数据驱动校验」，可检索属性抽出来拍平成倒排（ES / 倒排表）。新增一种商品类型 = 加配置，不改代码。
 
 **硬性要求**：
 - 每个 Go 服务是**独立 Go module + 独立 Dockerfile**，各自可单独 build 成镜像。
 - 后续迁移到 k3s，接 Prometheus + Grafana。
 
-**学习路径（四阶段，贯穿本项目）**：
-1. **搭环境**：学搭建写法 + 搭建类常见 bug（镜像拉取、配置、连接）。
-2. **懂架构**：理解一个完整产品能对外提供服务时的整体架构（组件职责、数据流向）。
-3. **模拟生产**：尽最大程度模拟真实数据量、性能瓶颈、突发流量。
-4. **保稳定**：在压力与故障中，从理论理解到手动保障产品稳定性。
+**学习路径（四阶段）**：
+1. **搭环境**：学搭建写法 + 搭建类 bug。
+2. **懂架构**：理解完整产品对外服务的整体架构（本题的读写分离、强一致/最终一致分层）。
+3. **模拟生产**：真实数据量、性能瓶颈、突发流量。
+4. **保稳定**：压力与故障中保障稳定性。
 
-**代码交付约定（重要）**：不要求每行代码手敲，但**每一块代码、每一个参数的选择，都必须注释清楚：它为了实现哪个需求、为了防止哪类问题、改错会触发哪个 bug（交叉引用 bug 编号）**。示例约定：
+**代码交付约定**：每一块代码、每一个参数都必须注释清楚「实现的需求 / 防止的问题 / 改错触发哪个 bug（交叉引用编号）」。示例：
 
 ```go
 // acks=all：等 ISR 全部副本确认才算发送成功。
-// 实现的需求：下单事件"不丢"（链路 B 正确性的前提）。
-// 防止的问题：K1 消息丢失。改成 0/1 即可复现该 bug。
+// 实现的需求：发布/订单事件"不丢"。
+// 防止的问题：K1 消息丢失。改成 0/1 即可复现。
 ```
 
 ## 2. 总体架构
 
 ```
-                        用户请求
+                        用户请求 / 商家发布
                           │
     ┌──────────────┬───────┴──────┬──────────────────┐
     ▼              ▼              ▼                  ▼
  product-service order-service search-service   load-gen(造数/压测)
-    │ 写MySQL      │ 写MySQL       │ 查Redis→ES      │
-    │ 布隆过滤器   │ 订单状态机    │                 │
-    │              │ (支付/超时/取消)│                 │
+ │ 发布(元数据驱动) │ 订单状态机     │ SearchEngine接口  │ 属性驱动生成
+ │ SPU归一/SKU笛卡尔│ 支付/超时/取消 │ ├ MySQL倒排实现   │ 类目/meta/SPU/SKU
+ │ 布隆/详情缓存    │              │ └ ES实现(facet)  │ zipf 热SKU
+    │ 写MySQL      │ 写MySQL       │ 查Redis缓存→引擎  │
     ▼              ▼              │                 │
   MySQL ──CDC──▶ Kafka ──▶ indexer ──▶ ES ◀─────────┘
- (products,      │             (消费 product.changed)
+ (category,     │   (消费 spu/sku/meta 变更,
+  attribute_meta,│    拍平JSON→倒排文档,
+  spu, sku,      │    维护MySQL倒排表)
   orders)        │
                  └──▶ order-worker (消费 order.events)
-                        ├─ 扣库存/回补库存(MySQL)
-                        ├─ 通知(日志)
-                        └─ 积分(Redis)
+                        ├─ 扣库存(sku, 防超卖; 热点走Redis预扣演进)
+                        ├─ 回补库存(取消时)
+                        ├─ 销量榜 ZINCRBY (支付时)
+                        └─ 积分/通知
 ```
 
-- **MySQL** = 事实来源；**Kafka** = 唯一事件总线；**ES** = 搜索投影；**Redis** = 读缓存 + 计数器 + 幂等去重 + 布隆位图。
-- **两种消息模式并存**：搜索链路用 CDC 捕获（业务零侵入），订单链路用服务直发（显式 producer），方便对比优劣。
-- **chaos 脚本**：随机 kill/重启服务，模拟服务器崩溃。
-- **kafka-inspector**：查看 topic/分区/消费组/lag/key 路由的小工具。
+- **MySQL** = 事实来源（关系列扛强一致）；**Kafka** = 唯一事件总线；**ES** = 可检索属性的倒排引擎；**Redis** = 详情缓存 + 三态库存 + 榜单 ZSET + 幂等 + 布隆位图。
+- **两种消息模式并存**：商品链路 CDC 捕获（发布零侵入），订单链路服务直发。
+- **SearchEngine 接口两个实现**：MySQL 倒排表（小团队方案）与 ES（上规模方案），显式能力协商。
 
 ## 3. 组件清单与服务划分
 
@@ -61,582 +67,440 @@
 
 | 组件 | 版本参考 | 说明 |
 |---|---|---|
-| MySQL | 8.x | 开 binlog（ROW 格式）、独立 server-id、建复制账号给 Debezium |
-| Kafka | KRaft 模式（无 ZK） | 单节点起步；topic：`product.changed`、`order.events` |
-| Kafka Connect + Debezium | Debezium 2.x | MySQL connector，捕获 binlog → `product.changed` |
-| Elasticsearch | 8.x | `products` 倒排索引 |
-| Redis | 7.x（已有镜像） | 缓存/计数/去重/布隆位图 |
+| MySQL | 8.x | binlog（ROW）、server-id、Debezium 复制账号；表见 §4 |
+| Kafka | KRaft | topic：`product.changed`、`order.events` |
+| Kafka Connect + Debezium | 2.x | 捕获 category/attribute_meta/spu/sku 变更 → `product.changed` |
+| Elasticsearch | 8.x | `sku` 倒排文档（属性拍平） |
+| Redis | 7.x | 缓存/三态库存/榜单/幂等/布隆位图 |
 
-> 用户没有 Kafka/ES/Prometheus/Grafana 镜像且未用过——实现阶段第一步是拉镜像 + 逐个上手引导（含在实现计划中）。
+### 3.2 Go 服务与工具（独立 module + 独立 Dockerfile）
 
-### 3.2 Go 服务与工具（每个都是独立 module + 独立 Dockerfile）
-
-| 服务 | 端口 | 职责 | 关键依赖 |
-|---|---|---|---|
-| `product-service` | 8080 | 商品 CRUD + 布隆过滤器维护；商品详情（Redis 缓存） | mysql、redis |
-| `order-service` | 8081 | 下单/模拟支付/取消/**超时扫描器**；状态机事件发 Kafka | mysql、kafka |
-| `indexer` | — | 消费 `product.changed` → ES | kafka、es |
-| `search-service` | 8082 | `/search?q=` → Redis 缓存 → ES | redis、es |
-| `order-worker` | — | 消费 `order.events`：扣/回补库存、积分、通知；可多实例演示 rebalance | kafka、mysql、redis |
-| `load-gen`（工具） | — | 造数（zipf 分布、百万级）、压测、突发流量 | 各客户端 |
-| `kafka-inspector`（工具） | — | 查看 topic/分区/消费组/lag/key→partition 路由演示 | kafka |
-| `chaos`（脚本） | — | 随机 kill/重启服务，模拟崩溃 | — |
+| 服务 | 端口 | 职责 |
+|---|---|---|
+| `product-service` | 8080 | 发布（幂等键、元数据驱动校验、SPU 归一、SKU 笛卡尔积、布隆 SETBIT）；详情（布隆 → Redis → MySQL）；类目/属性 meta 查询 |
+| `order-service` | 8081 | 下单（写 orders + 发 Kafka）；模拟支付；取消；超时扫描器 |
+| `indexer` | — | 消费 `product.changed`：spu/sku/meta 事件 → 缓存 spu/枚举映射 → 拍平写 ES + 维护 `product_attr_index` 表 |
+| `search-service` | 8082 | 搜索/筛选（`SearchEngine` 接口，`--engine=mysql|es`）；facet 聚合；热搜词 ZINCRBY；搜索缓存；本地 LRU + singleflight + 熔断 + 限流 |
+| `order-worker` | — | 消费 `order.events`：扣/回补库存（条件更新防超卖）、销量榜 ZINCRBY、积分、通知；可多实例演示 rebalance |
+| `load-gen` | — | 属性驱动造数（类目/meta/SPU/SKU/订单，zipf）、压测、突发流量 |
+| `kafka-inspector` | — | topic/分区/消费组/lag/key 路由演示 |
+| `chaos`（脚本） | — | 随机 kill/重启服务 |
 
 ### 3.3 目录结构
 
 ```
 D:\think_twice\experiment_env\
 ├── services/
-│   ├── product-service/   # module product-service
-│   │   ├── go.mod / main.go / internal/ / Dockerfile
-│   ├── order-service/     # module order-service（含状态机+超时扫描器）
-│   ├── indexer/           # module indexer
-│   ├── search-service/    # module search-service
-│   └── order-worker/      # module order-worker
+│   ├── product-service/   # 发布引擎（元数据驱动核心）
+│   ├── order-service/     # 状态机 + 超时扫描器
+│   ├── indexer/           # CDC 消费 + JSON 拍平 + 双写(ES/倒排表)
+│   ├── search-service/    # SearchEngine 接口 + 缓存/防线
+│   └── order-worker/      # 库存 + 榜单
 ├── tools/
-│   ├── load-gen/          # module load-gen
-│   └── kafka-inspector/   # module kafka-inspector
+│   ├── load-gen/          # 属性驱动造数
+│   └── kafka-inspector/
 ├── deploy/
 │   ├── docker-compose.yml
-│   ├── mysql/             # init.sql, my.cnf
+│   ├── mysql/             # init.sql（建表+种子类目/meta/枚举）, my.cnf
 │   ├── kafka-connect/     # connector 配置
-│   └── chaos.sh           # 混沌脚本
+│   └── chaos.sh
 ├── docs/
 │   ├── superpowers/specs/ # 设计文档
-│   ├── learning/          # 倒排索引/布隆过滤器原理等手把手材料
-│   └── diagrams/          # 架构图
+│   ├── learning/          # 倒排索引/布隆原理/商品中心场景题精讲
+│   └── diagrams/
 └── README.md
 ```
 
-> 各服务不共享代码包，少量公共小工具（config 解析、日志封装）在各服务内各自实现，保持服务自包含、bug 注入局部化。
-
 ## 4. 数据模型
 
-### 4.1 MySQL 表
+### 4.1 MySQL 表（商品中心，全部来自场景题）
 
 ```sql
-CREATE TABLE products (
-  id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-  title       VARCHAR(255) NOT NULL,
-  description TEXT,
-  price       DECIMAL(10,2) NOT NULL,
-  category    VARCHAR(64),
-  stock       INT NOT NULL DEFAULT 0,
-  created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-  updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  KEY idx_category (category)
-);
+-- 类目树：path 前缀匹配查子树，避免递归 CTE
+CREATE TABLE category (
+  id        BIGINT PRIMARY KEY,
+  parent_id BIGINT NOT NULL DEFAULT 0,
+  name      VARCHAR(128) NOT NULL,
+  level     TINYINT NOT NULL,
+  path      VARCHAR(256) NOT NULL,            -- "0/12/34/"
+  is_leaf   TINYINT NOT NULL DEFAULT 0,
+  status    TINYINT NOT NULL DEFAULT 1,
+  KEY idx_parent (parent_id), KEY idx_path (path)
+) ENGINE=InnoDB;
 
+-- 属性元数据：整题的"驱动引擎"，新增类型=加配置
+CREATE TABLE attribute_meta (
+  id          BIGINT PRIMARY KEY,
+  category_id BIGINT NOT NULL,                -- 绑定类目；0=全局
+  name        VARCHAR(64) NOT NULL,
+  value_type  ENUM('int','string','decimal','enum','range','date') NOT NULL,
+  is_key      TINYINT NOT NULL DEFAULT 0,     -- 关键属性→SPU 归一
+  is_sale     TINYINT NOT NULL DEFAULT 0,     -- 销售属性→SKU 笛卡尔积
+  is_search   TINYINT NOT NULL DEFAULT 0,     -- 进倒排
+  is_filter   TINYINT NOT NULL DEFAULT 0,     -- 做 facet 筛选
+  is_multi    TINYINT NOT NULL DEFAULT 0,
+  required    TINYINT NOT NULL DEFAULT 0,
+  enum_values JSON,                           -- [{"vid":1001,"text":"黑"}]
+  unit        VARCHAR(16),
+  sort_order  INT NOT NULL DEFAULT 0,
+  version     BIGINT NOT NULL DEFAULT 0,
+  KEY idx_cat (category_id, is_search, is_filter, is_sale)
+) ENGINE=InnoDB;
+
+-- SPU：标准化产品；JSON 存属性快照，用 vid 不用文本
+CREATE TABLE spu (
+  id           BIGINT PRIMARY KEY,
+  merchant_id  BIGINT NOT NULL DEFAULT 1,     -- 商家维度（简化版归属）
+  category_id  BIGINT NOT NULL,
+  brand_id     BIGINT NOT NULL,
+  title        VARCHAR(256) NOT NULL,
+  key_props    JSON NOT NULL,                 -- {"brand":100,"model":5100}
+  base_props   JSON,
+  key_hash     CHAR(32) NOT NULL,             -- key_props 排序后 MD5
+  status       TINYINT NOT NULL DEFAULT 1,
+  publish_time DATETIME NOT NULL,
+  UNIQUE KEY uk_spu (merchant_id, category_id, key_hash),  -- 带 merchant，防 B5
+  KEY idx_cat_time (category_id, publish_time),
+  KEY idx_keyhash (key_hash)                  -- 普通索引，归一候选检索
+) ENGINE=InnoDB;
+
+-- SKU：可售卖最小单元；price/stock 留关系列（交易强一致）
+CREATE TABLE sku (
+  id           BIGINT PRIMARY KEY,
+  spu_id       BIGINT NOT NULL,
+  sku_code     VARCHAR(64) NOT NULL,
+  sale_props   JSON NOT NULL,                 -- {"color":1001,"size":2003} 存 vid
+  sale_hash    CHAR(32) NOT NULL,
+  price        DECIMAL(12,2) NOT NULL,        -- 关系列：交易强一致
+  stock        INT NOT NULL,                  -- 关系列：扣库存强一致
+  frozen_stock INT NOT NULL DEFAULT 0,        -- 热点预扣演进用
+  status       TINYINT NOT NULL DEFAULT 1,
+  UNIQUE KEY uk_sku (spu_id, sale_hash),
+  KEY idx_spu (spu_id)
+) ENGINE=InnoDB;
+
+-- MySQL 倒排表：SearchEngine 的"小团队实现"
+CREATE TABLE product_attr_index (
+  attr_id        BIGINT NOT NULL,
+  attr_value_id  BIGINT NOT NULL,
+  product_type   TINYINT NOT NULL,            -- 1=spu 2=sku
+  product_id     BIGINT NOT NULL,
+  attr_value     VARCHAR(128),
+  PRIMARY KEY (attr_id, attr_value_id, product_id)
+) ENGINE=InnoDB;
+
+-- 订单：交易侧只认 sku 强一致行
 CREATE TABLE orders (
   id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-  order_no   VARCHAR(64) NOT NULL UNIQUE,   -- 幂等键 + Kafka 分区 key
-  product_id BIGINT NOT NULL,
+  order_no   VARCHAR(64) NOT NULL UNIQUE,     -- 幂等键 + Kafka 分区 key
+  sku_id     BIGINT NOT NULL,
   quantity   INT NOT NULL,
   amount     DECIMAL(10,2) NOT NULL,
   status     VARCHAR(24) NOT NULL DEFAULT 'CREATED',
-    -- CREATED → PAID / CANCELLED / TIMEOUT_CANCELLED
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  KEY idx_status_created (status, created_at)   -- 超时扫描器专用索引
-);
+  KEY idx_status_created (status, created_at)
+) ENGINE=InnoDB;
 ```
 
-### 4.2 订单状态机（链路 B 核心）
+> 种子数据（deploy/mysql/seed.sql）：类目树（3 层、几十个叶子类目：男装>T恤、3C>手机、家电>冰箱…）、每个叶子类目的 attribute_meta（服饰：款号/颜色/尺码/材质；3C：品牌/型号/颜色/内存/上市时间）、枚举值字典（颜色：黑/白/蓝…，内存：128/256/512…）。
+
+### 4.2 订单状态机（同 v2，订单引用 sku）
 
 ```
-           下单                模拟支付成功
- CREATED ─────────▶ PAID ───────────▶ （加积分）
-    │                  ▲
-    │ 手动取消/超时     │ 支付失败（可配失败率）
-    ▼                  │
- CANCELLED / TIMEOUT_CANCELLED ───▶ order-worker 回补库存
+ CREATED ──支付──▶ PAID ──▶（加积分 + 销量榜 ZINCRBY）
+    │
+    ├─ 手动取消 / 超时(60s) ──▶ CANCELLED / TIMEOUT_CANCELLED ──▶ 回补库存
 ```
 
-- **模拟支付网关**：`POST /orders/{order_no}/pay`，随机延迟 50–500ms + 可配失败率（默认 0，演练时调 30%）。
-- **超时扫描器**：order-service 内 ticker 每 5s 扫 `status='CREATED' AND created_at < NOW()-INTERVAL 60 SECOND`（窗口可配），批量置为 `TIMEOUT_CANCELLED` 并发事件。生产一般用延迟队列，此简化为定时扫描，文档注明差异。
-- **并发安全**：状态迁移用条件更新 `UPDATE ... WHERE status='CREATED'`，防支付/取消竞态（bug B3 即破坏它）。
-- **幂等**：重复支付 PAID 订单 → no-op；支付 CANCELLED 订单 → 拒绝。
+- 模拟支付网关：随机延迟 + 可配失败率；超时扫描器：ticker 扫 `status='CREATED' AND created_at < NOW()-60s`。
+- 并发安全：状态迁移条件更新 `WHERE status='CREATED'`（bug B3 即破坏它）。
+- 幂等：重复支付 no-op；支付已取消订单拒绝。
 
 ### 4.3 Kafka topic
 
-| topic | 分区 | key | 来源 | 事件类型 |
+| topic | 分区 | key | 来源 | 内容 |
 |---|---|---|---|---|
-| `product.changed` | 3 | product id | Debezium | CREATE/UPDATE |
-| `order.events` | 3 | order_no | order-service 直发 | ORDER_CREATED / ORDER_PAID / ORDER_CANCELLED / ORDER_TIMEOUT_CANCELLED |
+| `product.changed` | 3 | 主键 id | Debezium | category/attribute_meta/spu/sku 的 INSERT/UPDATE（含来源表名） |
+| `order.events` | 3 | order_no | order-service | ORDER_CREATED/PAID/CANCELLED/TIMEOUT_CANCELLED |
 
-> `order.events` 以 order_no 为 key：**同一订单的生命周期事件必然落同一分区、严格有序**——这本身就是 K3（乱序）教学点的正确示范。
+消息信封同 v2：`{event_id, event_type, key, occurred_at, payload}`；消费者逐条打印 `(topic, partition, offset, key)`。
 
-### 4.4 消息信封格式（统一，带 label 便于理解 partition/topic）
+### 4.4 ES 文档（SKU 粒度，属性拍平）
 
 ```json
 {
-  "event_id": "uuid",
-  "event_type": "ORDER_CREATED",
-  "key": "ORDER20261028...",        // 分区 key，hash(key)%分区数 决定落点
-  "occurred_at": "2026-10-28T15:00:00Z",
-  "payload": { "order_no": "...", "product_id": 123, "quantity": 1, "amount": 99.9 }
+  "sku_id": 5001, "spu_id": 500, "title": "iPhone 15 Pro 256G 黑色",
+  "category_id": 12, "category_path": "0/5/12/",
+  "price": 8999.0, "stock": 120, "status": 1,
+  "props": { "color": "黑", "memory": "256G" }     // vid→文本映射后的可检索字段
 }
 ```
 
-消费者统一日志格式（教学用，每条消息可见）：
+- 索引消费者把 CDC 事件里的 JSON 属性**拍平成字段**（vid 用缓存的 enum_values 换成文本）。
+- 筛选「颜色=黑 且 内存=256G」= ES `bool filter`；筛选栏计数 = `terms agg`（facet）。
 
-```
-[order.events] partition=1 offset=42 key=ORDER... event=ORDER_CREATED payload=...
-```
-
-### 4.5 ES 索引 `products`
-
-- `title`、`description`：text（倒排，全文检索）
-- `category`：keyword / `price`：double / `stock`：integer
-
-### 4.6 Redis key
+### 4.5 Redis key
 
 | key | 用途 | TTL |
 |---|---|---|
-| `search:{q}` | 搜索结果缓存 | 随机 5–10min |
-| `product:{id}` | 商品详情缓存 | 10min |
-| `order:dedup:{order_no}` | 消费幂等去重 | 24h |
-| `points:user:{id}` | 积分计数 | 不过期 |
-| `bf:products` | **手搓布隆过滤器位图**（Redis bitmap） | 不过期 |
+| `spu:{id}` | 详情页正排缓存（spu+sku 列表） | 10min |
+| `search:{engine}:{category_id}:{filter_hash}:{page}` | 搜索结果缓存 | 随机 5–10min |
+| `stock_state:sku:{id}` | **库存三态**（有货/无货/紧张），不存精确 int | 5–15s |
+| `stock:sku:{id}` | 热点库存预扣（演进 drill，Lua DECR） | 不过期 |
+| `rank:sales` | **ZSET 销量榜**（支付时 ZINCRBY spu_id） | 不过期 |
+| `rank:hotsearch` | **ZSET 热搜词**（搜索时 ZINCRBY 词） | 不过期 |
+| `order:dedup:{order_no}` | 消费幂等 | 24h |
+| `idempotency:{merchant_id}:{client_req_id}` | 发布幂等键 | 24h |
+| `bf:spu` | 手搓布隆过滤器位图 | 不过期 |
+| `points:user:{id}` | 积分 | 不过期 |
 
-## 5. 数据流
+## 5. 核心业务逻辑（场景题的 Go 落地）
 
-### 链路 A（搜索，CDC 模式）
+### 5.1 发布（product-service 写路径）
+
+1. 商家选叶子类目 → 拉该类目全部 `attribute_meta`。
+2. **幂等抢占**：`SET idempotency:{merchant}:{req_id} 1 NX EX 86400`（防 B4）。
+3. **元数据驱动校验**：通用 `switch value_type`（enum 查 enum_values、range 查区间…），代码里永远不出现 `if name=="颜色"`。
+4. **SPU 归一**：关键属性排序后 `key_hash=md5`，`INSERT ... ON DUPLICATE KEY`（唯一键带 merchant_id）。
+5. **SKU 笛卡尔积**：销售属性组合递归生成；护栏：维度 ≤3、每维枚举 ≤50（防 B6）。
+6. 落库 spu/sku + 布隆 `SETBIT bf:spu {id}`。
+7. 发布后：binlog → CDC → Kafka → indexer → ES（最终一致，无需改发布代码）。
+
+### 5.2 SearchEngine 接口（两个实现 + 能力协商）
+
+```go
+type SearchEngine interface {
+    Search(ctx, Query) (Hits, error)   // 交集语义：category + filters + sort + page
+    Facet(ctx, Query) (Facets, error)  // 只有 ES 实现支持实时聚合
+}
+// 实现一：MySQL product_attr_index —— 等值命中交集；不支持 facet、深翻页
+// 实现二：ES —— bool filter + terms agg；分页用 search_after（防 E3）
+```
+
+- 筛选「颜色=黑 且 内存=256G」在 MySQL 实现是 `(attr_id,attr_value_id)` 两次等值命中求交集，主键天然覆盖；ES 实现是 term 查询。
+- **能力协商**：深翻页/实时 facet 显式标注只有 ES 有（对应场景题追问 4）。
+
+### 5.3 库存（三层语义，对应追问 2）
+
+- **权威**：`sku.stock` 关系列，条件更新防超卖：`UPDATE sku SET stock=stock-? WHERE id=? AND stock>=?`。
+- **展示**：详情页只展示三态（有货/无货/紧张），`stock_state:sku:{id}` 短 TTL——**绝不缓存精确 int**（防 B9）。
+- **演进 drill**：压测暴露单行热点后，按答辩 2 实现 Redis Lua 预扣（`frozen_stock` 冻结 + `DECR` + 异步落库 + 对账），体会"强一致 → 最终一致"的取舍（B8 即该链路的 bug）。
+
+### 5.4 Redis 挂掉三道防线（对应追问 3）
+
+1. **本地缓存**：进程内 LRU（热点 spu/搜索结果），TTL 短于 Redis。
+2. **熔断降级**：Redis 连续失败 N 次 → 熔断 → 快速失败/兜底数据。
+3. **限流**：令牌桶把打到 MySQL 的 QPS 压到阈值内，超出 429。
+4. 配套：singleflight 防击穿、负缓存防穿透、TTL 随机抖动防雪崩。
+
+### 5.5 ZSET 榜单
+
+- `rank:sales`：order-worker 收到 ORDER_PAID → `ZINCRBY rank:sales {qty} spu:{id}`；热销榜 API → `ZREVRANGE 0 99 WITHSCORES`。
+- `rank:hotsearch`：search-service 每次查询 → `ZINCRBY rank:hotsearch 1 {词}`；热搜榜 API → top 10。
+- 教学点：ZSET 跳表、score 与 member、top-N 与范围查询（`ZREVRANGEBYSCORE`）。
+
+## 6. 数据流
+
+### 链路 A（商品上架 → 可搜索，CDC 模式）
 
 ```
-product-service → 写 products（同时 SETBIT 布隆）→ MySQL binlog
-→ Debezium → Kafka(product.changed) → indexer → ES(products)
-search-service: /search?q= → Redis(search:{q}) 命中返回
-                             └ 未命中 → ES → 回写 Redis
-product-service: /products/{id} → 先查布隆(不存在直接404) → Redis → MySQL
+发布 → product-service(校验/SKU/幂等) → MySQL(spu/sku JSON)
+→ binlog → Debezium → Kafka(product.changed)
+→ indexer：spu/sku/meta 事件 → 缓存 spu 与枚举映射 → 拍平 JSON
+→ ES(sku 文档) + product_attr_index 表
+搜索 → search-service：Redis 搜索缓存 → 命中返回
+       └ 未命中 → SearchEngine(ES/MySQL) → 回写缓存 + 热搜词 ZINCRBY
+详情 → product-service：布隆(不存在404) → Redis spu:{id} → MySQL
 ```
 
 ### 链路 B（订单，直发模式 + 状态机）
 
 ```
 order-service: 下单 → 写 orders + 发 ORDER_CREATED
-  ├─ 支付(模拟) → 条件更新 PAID + 发 ORDER_PAID
-  ├─ 超时扫描器 → 条件更新 TIMEOUT_CANCELLED + 发事件
-  └─ 手动取消 → 条件更新 CANCELLED + 发事件
-order-worker（消费组 order-worker-group）:
-  ├─ ORDER_CREATED → 扣库存（条件扣减防超卖）
-  ├─ ORDER_CANCELLED/TIMEOUT_CANCELLED → 回补库存
-  └─ ORDER_PAID → 加积分 + 通知(日志)
+  ├─ 支付 → 条件更新 PAID + 发 ORDER_PAID
+  ├─ 超时/手动取消 → 条件更新 + 发事件
+order-worker:
+  ├─ ORDER_CREATED → 扣库存(sku 条件更新) + 写三态缓存
+  ├─ ORDER_CANCELLED/TIMEOUT_CANCELLED → 回补库存 + 写三态缓存
+  └─ ORDER_PAID → 销量榜 ZINCRBY + 积分 + 通知
 ```
 
-## 6. 数据生成与规模（load-gen 能力）
+## 7. 数据生成与规模（属性驱动，真实实体）
 
-- **真实感数据**：商品标题按品类模板生成（数码/服装/食品…），订单引用商品/用户 ID。
-- **zipf 分布**（热销商品/热用户）：`--zipf 0.9` 生成长尾分布——天然制造**热 Key（R6）**与 **Kafka 分区倾斜（B1）**，这是真实电商数据的本质特征。
-- **规模模式**：批量造数（`--count 1000000 --batch 5000`，多行 INSERT，百万行分钟级）；流式压测（`--rate 500/s`）。
-- **突发流量**：`burst --base 100 --peak 2000 --duration 30s` 模拟秒杀/大促尖峰。
-- **路由报告**：造数后打印"key→partition"落点统计，直观验证 `hash(key)%3` 与倾斜程度。
-- **kafka-inspector**：列出 topic/分区/消费组，展示每分区 offset 与 lag——lag 是判断"堆积（K4）"的眼睛。
+- **种子**：类目树 + attribute_meta + 枚举值（deploy/mysql/seed.sql，几十个叶子类目）。
+- **SPU/SKU 生成**：按类目模板（3C>手机：品牌×型号×颜色×内存；服饰：款号×颜色×尺码）生成真实感标题；SKU 由销售属性笛卡尔积产生。目标：SPU 10 万–50 万、**SKU 百万级**、orders 百万级。
+- **zipf 分布**：订单/搜索按 zipf 打热 SKU——天然制造热 Key（R6）、分区倾斜（B1）、单行库存热点（追问 2 的靶子）。
+- **突发流量**：`burst --base 100 --peak 2000 --duration 30s`。
+- **路由报告**：key→partition 落点统计；kafka-inspector 看 lag/分区分布。
 
-## 7. Redis 手搓布隆过滤器（穿透防护）
+## 8. Redis 手搓布隆过滤器
 
-- **原理**（docs/learning/bloom-filter.md 手把手推导）：m 位位数组 + k 个哈希；误判率 `p ≈ (1-e^(-kn/m))^k`；只误报不漏报、不可删除。
-- **实现**：Go 手写——双重哈希 `h_i(x) = h1(x) + i·h2(x) mod m`（h1=fnv、h2=murmur），位图落在 **Redis bitmap**（`SETBIT/GETBIT bf:products`），**不用 RedisBloom 模块**，现有镜像即可。
-- **用途**：商品 ID 查询先过布隆——不存在直接 404，挡住 MySQL（R1 穿透的正确解）。
-- **参数选择注释**：m、k 怎么定（按预期商品量 10^6 与目标误判率 1% 反推），写进代码注释。
+- 原理（docs/learning/bloom-filter.md）：m 位 + k 哈希，`p ≈ (1-e^(-kn/m))^k`；只误报不漏报、不可删。
+- 实现：Go 手写双重哈希（fnv+murmur），位图落 Redis bitmap（`SETBIT/GETBIT bf:spu`），不用 RedisBloom 模块。
+- 用途：`GET /spu/{id}` 先查布隆，不存在直接 404；发布时 SETBIT。
+- 参数选择（m/k 按 10^6 商品、1% 误判反推）写进代码注释；误设 = bug R8。
 
-## 8. MySQL 性能优化 Lab（百万行练习）
+## 9. MySQL 性能优化 Lab（百万行，真实实体）
 
-数据量：`products` 1M–10M 行、`orders` 1M–10M 行（load-gen 批量造）。练习项（每项都是 bug 卡）：
+数据：SKU 百万级、orders 百万级。练习项（每项对应 bug 卡）：
 
-1. 无索引全表扫 vs 建索引——`EXPLAIN` 对比执行计划
-2. 复合索引最左前缀原则
+1. 无索引全表扫 vs 建索引——`EXPLAIN` 对比
+2. 复合索引最左前缀（`idx_status_created`）
 3. 深分页 `LIMIT 1000000,10` → 游标/延迟关联
-4. 回表 vs 覆盖索引（`SELECT title` vs `SELECT *` 的 Using index 差异）
-5. 隐式类型转换索引失效（`WHERE varchar_col = 123`）
-6. `LIKE '%x%'` 前导通配符索引失效 → **引出"为什么搜索不用 LIKE 而用 ES"**（呼应链路 A 价值）
+4. 回表 vs 覆盖索引（`SELECT sku_id` vs `SELECT *`）
+5. 隐式类型转换索引失效（`WHERE varchar = 123`）
+6. **JSON_EXTRACT 直接 where → 慢查询**（M6，场景题坑 1）→ 对比倒排表/ES，这就是"为什么搜索交给 ES"
+7. `LIKE '%x%'` 索引失效
+8. 批量插入优化（多行 INSERT、关 autocommit）
 
-## 9. Go 服务技术要点（重点示范）
+## 10. Go 服务技术要点
 
-- goroutine 消费循环 + `channel`；`context` + `signal.NotifyContext` 优雅退出
-- Kafka 消费者组、手动提交 offset、幂等消费（Redis SETNX + 状态机条件更新）
-- 生产者 `acks=all` + 幂等；Redis `singleflight` 防击穿；随机 TTL 防雪崩
-- 超时扫描器 ticker 模式；条件更新（乐观锁）防并发竞态
-- HTTP：超时、连接池、响应体关闭、结构化日志
+- 元数据驱动校验（通用 switch + enum_values）
+- SKU 笛卡尔积递归生成 + 护栏
+- SearchEngine interface 多态（两实现 + 能力协商）
+- goroutine 消费循环、context 优雅退出、手动提交 offset、幂等消费
+- Redis Lua 脚本（预扣演进）、singleflight、熔断、令牌桶限流、本地 LRU
+- 条件更新（乐观锁）防并发竞态
 
-## 10. 可靠性设计（「正确版」基线，bug 即破坏它）
+## 11. 可靠性设计（「正确版」基线）
 
-- **Kafka**：producer `acks=all` + 幂等；consumer 手动提交 offset + 按 order_no 幂等去重；毒丸消息进死信/带重试退避。
-- **Redis**：Cache-Aside；穿透→布隆+空值缓存；击穿→`singleflight`；雪崩→随机 TTL；一致性→先更新 DB 再删缓存。
-- **MySQL**：索引设计、条件更新防竞态、批量操作。
-- **服务**：优雅退出、goroutine 不泄漏、连接池上限、响应体关闭、结构化日志。
+- **Kafka**：acks=all + 幂等；手动提交 offset；幂等去重；毒丸进死信。
+- **Redis**：Cache-Aside；穿透→布隆+负缓存；击穿→singleflight；雪崩→随机 TTL；一致性→先更新 DB 再删缓存；库存只缓存三态。
+- **MySQL**：关系列扛强一致；JSON 只存不查；索引设计；条件更新。
+- **服务**：发布幂等键、归属校验（merchant_id 拼进 WHERE）、优雅退出、连接池上限、结构化日志。
 
-## 11. 故障清单（41 个，五要素）
+## 12. 故障清单（50 个，五要素）
 
-> 用法：按「注入」改代码/配置 → 观察「症状」→ 用「排查」线索定位 → 自己修复 → 再对照「根因/修复」核对。
+> 用法：按「注入」改代码/配置 → 观察「症状」→ 按「排查」线索定位 → 自己修复 → 对照「根因/修复」核对。
 
 ### Kafka 类（8）
 
-**K1 消息丢失**
-- 注入：order-service 把 producer `acks` 从 `all` 改成 `0`
-- 症状：压测中 kill broker，部分订单「写库成功但下游没收到」，库存/积分对不上
-- 排查：对比 `orders` 表行数 vs order-worker 处理数；topic 消息数偏少
-- 根因：`acks=0` 不等确认即返回成功，leader 故障时消息未落盘
-- 修复：`acks=all` + `min.insync.replicas≥2`
+**K1 消息丢失**：注入 `acks` 改 0｜症状 kill broker 部分事件下游没收到｜排查 对比订单数 vs 处理数｜根因 acks=0 不等确认｜修复 `acks=all` + `min.insync.replicas≥2`
+**K2 消息重复**：注入 先处理业务后提交 offset + 中途崩溃｜症状 同一订单扣两次库存｜排查 同一 order_no 处理多次｜根因 at-least-once｜修复 `SETNX order:dedup` 幂等
+**K3 消息乱序**：注入 key 随机/不设｜症状 同订单 CREATED/CANCELLED 颠倒｜排查 同订单跨分区｜根因 key 不稳定路由到不同分区｜修复 用 order_no 做 key
+**K4 消息堆积**：注入 消费加 sleep + 分区设 1｜症状 lag 持续涨｜排查 kafka-inspector 看 lag｜根因 消费速率 < 生产速率｜修复 去慢逻辑/加分区加实例
+**K5 rebalance 风暴**：注入 `max.poll.interval.ms=3s` + 处理慢｜症状 反复 joining group｜排查 日志频繁 rebalance｜根因 poll 超时被踢出组｜修复 调大间隔/加快处理
+**K6 毒丸消息**：注入 混入反序列化失败消息｜症状 该分区卡死不再前进｜排查 日志停在同一条报错｜根因 坏消息未隔离｜修复 死信 topic 隔离
+**K7 offset 重置**：注入 改 group.id / `auto.offset.reset=earliest`｜症状 历史重放或丢老消息｜排查 对比 group offset 与 topic 位置｜根因 group id 是 offset 存储键｜修复 不随意改 group id
+**K8 未 flush**：注入 退出前不 `producer.Close()`｜症状 退出瞬间丢最后几条｜排查 末尾消息缺失｜根因 缓冲未刷盘｜修复 `defer producer.Close()`
 
-**K2 消息重复**
-- 注入：order-worker 改成「先处理业务、后提交 offset」，处理中途随机崩溃
-- 症状：重启后同一订单被扣两次库存/加两次积分
-- 排查：同一 order_no 被处理多次；dedup key 命中
-- 根因：at-least-once 语义，已处理未提交
-- 修复：处理前 `SETNX order:dedup:{order_no}` 幂等去重
+### Redis 类（9）
 
-**K3 消息乱序**
-- 注入：order-service 发事件时 key 用随机值/不设 key
-- 症状：同一订单 CREATED 与 CANCELLED 顺序颠倒，状态机错乱（先取消后创建）
-- 排查：打印每条消息的 (partition, offset, order_no)，同订单跨分区
-- 根因：key 不稳定导致同实体消息路由到不同 partition，跨分区无序
-- 修复：用 order_no 做 key，同 key 同分区
-
-**K4 消息堆积**
-- 注入：order-worker 处理逻辑加 `time.Sleep`；同时把分区设成 1
-- 症状：lag 持续增长，下单很久后才扣库存
-- 排查：kafka-inspector 看 lag；分区数与消费者数
-- 根因：消费速率 < 生产速率，分区数限制并行上限
-- 修复：去掉慢逻辑/改异步，加分区并扩容消费者实例
-
-**K5 rebalance 风暴**
-- 注入：`max.poll.interval.ms` 设 3s，处理逻辑耗时
-- 症状：日志刷「(Re-)joining group」，几乎不消费
-- 排查：消费者日志频繁 rebalance
-- 根因：两次 poll 间隔超时被踢出组，反复重加入
-- 修复：调大 `max.poll.interval.ms` 或加快单批处理
-
-**K6 毒丸消息**
-- 注入：order.events 混入一条反序列化失败/字段非法（price 为空）的消息
-- 症状：消费循环卡在报错处，该 partition 不再前进
-- 排查：日志停在同一条消息报错；该分区 lag 不减少
-- 根因：坏消息未隔离，异常阻塞消费
-- 修复：解析失败写死信 topic，继续消费后续
-
-**K7 offset 重置导致重复/丢**
-- 注入：改 `group.id`，或 `auto.offset.reset=earliest`
-- 症状：历史消息重放（库存多扣）或从最新开始丢老消息
-- 排查：对比消费组 offset 与 topic 位置
-- 根因：group id 是 offset 存储键，改了即定位变化
-- 修复：不随意改 group id；按需选 reset 策略
-
-**K8 生产者未 flush/未 close**
-- 注入：order-service 退出前不 `producer.Close()`
-- 症状：退出瞬间最后几条消息丢失
-- 排查：退出日志 vs topic 消息数，末尾缺失
-- 根因：缓冲未刷盘即退出
-- 修复：优雅退出时 `defer producer.Close()`
-
-### Redis 类（8）
-
-**R1 缓存穿透**
-- 注入：product-service 去掉布隆/空值缓存，大量查不存在商品 id
-- 症状：不存在的 key 全部打穿到 MySQL，DB 被打爆
-- 排查：Redis 命中率骤降，MySQL 慢查询激增
-- 根因：查不存在 key 无防护
-- 修复：布隆过滤器 + 空值短 TTL 缓存
-
-**R2 缓存击穿**
-- 注入：热点商品详情缓存到期，去掉 `singleflight`/锁
-- 症状：过期瞬间大量请求同时打到 MySQL
-- 排查：DB 慢查询时间点尖峰，对应某商品缓存过期
-- 根因：热点 key 过期无互斥
-- 修复：`singleflight` 或互斥锁，只让一个请求重建
-
-**R3 缓存雪崩**
-- 注入：所有缓存 TTL 设相同值
-- 症状：某时刻大量 key 同时过期，后端被打垮
-- 排查：缓存过期时间戳集中在同一时刻
-- 根因：过期时间无随机化
-- 修复：TTL 加随机偏移（10min ± 30%）
-
-**R4 缓存与 DB 不一致**
-- 注入：更新商品时「先删缓存、再更新 DB」且并发读
-- 症状：更新后立刻读，偶发读到旧值
-- 排查：回填旧值的时序交错
-- 根因：删/改顺序与并发读时序交错
-- 修复：先更新 DB 再删缓存；严格场景延迟双删/版本号
-
-**R5 Big Key**
-- 注入：某商品描述塞几 MB 大 value 存 Redis
-- 症状：GET/SET 该 key 变慢，阻塞 Redis 单线程
-- 排查：`redis-cli --bigkeys`、`slowlog`
-- 根因：大 value 网络/内存/序列化开销大，阻塞单线程
-- 修复：拆分/压缩/改存对象存储
-
-**R6 热 Key**
-- 注入：load-gen zipf 集中狂打同一热门商品
-- 症状：该 key 所在节点 CPU 打满，其它 key 响应变慢
-- 排查：monitor/统计热点 key QPS
-- 根因：单 key 超高频访问，单点瓶颈
-- 修复：本地缓存（多级缓存）、key 拆分分摊
-
-**R7 内存打满 / 淘汰误伤**
-- 注入：关 TTL + `maxmemory` 很小 + `allkeys-lru`
-- 症状：内存打满后热点也被淘汰，命中率暴跌
-- 排查：`info memory`、`evicted_keys` 上升
-- 根因：无 TTL + 淘汰策略不当
-- 修复：合理 TTL、分优先级、扩容/分片
-
-**R8 布隆过滤器参数错误**
-- 注入：把布隆的 m（位数）设过小/k 不对（如按 10 万商品设计却灌 100 万）
-- 症状：误判率飙升——大量不存在的 ID 被放过打穿 DB，或正常请求被误拦
-- 排查：计算实际误判率 vs 设计值；Redis `bf:products` 位填充率接近 100%
-- 根因：m/k 与数据量不匹配，位数组过载
-- 修复：按预期数据量 n 和目标误判率 p 反推 `m = -n·ln p/(ln 2)²`，`k = m/n·ln 2`
+**R1 缓存穿透**：注入 去布隆/负缓存，狂查不存在 ID｜症状 DB 被打爆｜排查 Redis 命中率骤降｜根因 不存在 key 无防护｜修复 布隆 + 负缓存
+**R2 缓存击穿**：注入 热点 spu 过期且去 singleflight｜症状 过期瞬间并发打 MySQL｜排查 DB 慢查询时间点尖峰｜根因 热点过期无互斥｜修复 singleflight/互斥锁
+**R3 缓存雪崩**：注入 全部 TTL 相同｜症状 齐过期后端打垮｜排查 过期时间戳集中｜根因 无随机化｜修复 TTL 随机偏移
+**R4 缓存与 DB 不一致**：注入 先删缓存再更新 DB + 并发读｜症状 偶发读到旧值｜排查 回填旧值时序｜根因 删/改顺序交错｜修复 先更新 DB 再删缓存
+**R5 Big Key**：注入 某 spu 详情塞几 MB｜症状 GET/SET 慢、阻塞单线程｜排查 `--bigkeys`/slowlog｜根因 大 value 开销｜修复 拆分/压缩
+**R6 热 Key**：注入 zipf 狂打同一 SKU 详情｜症状 单 key CPU 打满｜排查 monitor 热点 QPS｜根因 单点高频｜修复 本地缓存/key 拆分
+**R7 内存打满**：注入 关 TTL + 小 maxmemory + allkeys-lru｜症状 热点被淘汰命中率暴跌｜排查 `info memory`/evicted_keys｜根因 无 TTL + 策略不当｜修复 合理 TTL/分优先级
+**R8 布隆参数错误**：注入 m 太小/k 不对（按 10 万设计灌 100 万）｜症状 误判率飙升穿透 DB｜排查 位填充率近 100%｜根因 m/k 与数据量不匹配｜修复 按 n、p 反推 m/k
+**R9 本地缓存失效不一致**：注入 上本地 LRU 后改价/下架不广播｜症状 多实例返回新旧不同价格｜排查 轮询实例结果不同｜根因 进程内缓存无失效｜修复 CDC 广播失效 / 本地只缓存静态字段
 
 ### CDC 类（4）
 
-**C1 CDC 断流不恢复**
-- 注入：`docker stop` kafka-connect，商品继续上架
-- 症状：新商品搜不到，ES 停止更新，无人察觉
-- 排查：Connect 状态；`product.changed` 无新消息
-- 根因：连接器挂了无告警/无自动恢复
-- 修复：健康检查 + 告警 + 自动重启
-
-**C2 位点丢失导致重复/丢**
-- 注入：重置 Debezium offset 存储（或改 connector 名重建）
-- 症状：全量重放（ES 重复）或跳过中间段（ES 缺数据）
-- 排查：ES 文档数 vs MySQL 行数
-- 根因：offset 是消费进度唯一依据
-- 修复：offset 存 Kafka 内部 topic，勿随意清；重建前做快照
-
-**C3 schema 不匹配**
-- 注入：`ALTER TABLE products ADD COLUMN` 新字段
-- 症状：connector 报错停止，后续变更不同步
-- 排查：Connect 日志 schema 校验失败
-- 根因：表结构变更后 schema 历史未跟上
-- 修复：schema 演进配置或重建 connector
-
-**C4 全量快照与增量切换丢数据**
-- 注入：初始快照期间持续写入新数据
-- 症状：快照窗口内的部分写入缺失于 ES
-- 排查：快照时间窗口内的写入未进 ES
-- 根因：快照与 binlog 切换存在窗口
-- 修复：snapshot 一致性策略（`snapshot.mode=when_needed` + 位点衔接）
+**C1 CDC 断流**：注入 stop kafka-connect｜症状 新商品搜不到无感知｜排查 Connect 状态、topic 无新消息｜根因 无告警/自愈｜修复 健康检查 + 告警 + 重启
+**C2 位点丢失**：注入 重置 Debezium offset / 改 connector 名｜症状 全量重放或跳跃缺失｜排查 ES 文档数 vs MySQL 行数｜根因 offset 是进度唯一依据｜修复 勿清 offset、重建前快照
+**C3 schema 不匹配**：注入 `ALTER TABLE` 加字段｜症状 connector 报错停｜排查 Connect schema 日志｜根因 schema 历史未跟上｜修复 schema 演进配置/重建 connector
+**C4 快照/增量切换丢数据**：注入 初始快照期间持续写入｜症状 快照窗口写入缺失｜排查 窗口内写入未进 ES｜根因 切换存在窗口｜修复 一致性快照策略 + 位点衔接
 
 ### Go 并发类（5）
 
-**G1 goroutine 泄漏**
-- 注入：每收到一条消息 `go` 一个 goroutine，无 context 取消
-- 症状：goroutine 数持续增长，内存上涨至 OOM
-- 排查：`pprof` goroutine 数单调递增
-- 根因：goroutine 无退出机制
-- 修复：传 `context` + `select` 监听取消，或 worker pool
+**G1 goroutine 泄漏**：注入 每消息 go 一个无 context｜症状 goroutine/内存涨到 OOM｜排查 pprof 递增｜根因 无退出机制｜修复 context + select / worker pool
+**G2 map 并发写 panic**：注入 全局 map 多 goroutine 写｜症状 `concurrent map writes`｜排查 panic 栈｜根因 map 非并发安全｜修复 sync.Map/锁/channel
+**G3 未优雅退出**：注入 SIGTERM 直接 os.Exit｜症状 发布时消息丢/重｜排查 offset 未提交｜根因 未收尾｜修复 NotifyContext + 提交后再退
+**G4 连接池耗尽**：注入 MaxOpenConns=1｜症状 高并发超时排队｜排查 db.Stats 打满｜根因 池太小｜修复 合理配置 + 超时
+**G5 响应体未关闭**：注入 不 defer Body.Close()｜症状 连接泄漏端口耗尽｜排查 netstat 连接增长｜根因 连接无法复用｜修复 defer Close + 读空 body
 
-**G2 map 并发写 panic**
-- 注入：search-service 用全局 `map` 缓存且多 goroutine 并发写
-- 症状：panic `concurrent map writes`
-- 排查：panic 栈指向 map 写入
-- 根因：Go map 非并发安全
-- 修复：`sync.Map` / 加锁 / channel 串行化
+### ES 类（3）
 
-**G3 未优雅退出丢消息**
-- 注入：收到 SIGTERM 直接 `os.Exit`
-- 症状：发布时正在处理的消息丢失或重复
-- 排查：发布时日志中断，offset 未提交
-- 根因：未捕获退出信号收尾
-- 修复：`signal.NotifyContext` + 等当前批完成 + 提交 offset 再退出
+**E1 索引不一致**：注入 indexer 处理一半 kill -9｜症状 搜索漏结果｜排查 ES count vs MySQL count｜根因 崩溃漏写未重放｜修复 处理+写+提交 offset 顺序正确幂等
+**E2 刷新延迟**：注入 refresh_interval 调 30s｜症状 刚上架搜不到几秒后才出现｜排查 写入后立即查 vs 稍后查｜根因 refresh 后才可搜｜修复 理解 refresh 语义
+**E3 深翻页**：注入 from+size 翻过 10000｜症状 直接报错/延迟随页线性涨｜排查 ES `Result window is too large`｜根因 from+size 全捞再截断｜修复 search_after 游标
 
-**G4 连接池耗尽**
-- 注入：`SetMaxOpenConns(1)` 且请求阻塞
-- 症状：高并发下请求大量超时/排队
-- 排查：`db.Stats()` 连接数打满
-- 根因：连接池太小
-- 修复：合理 MaxOpenConns/MaxIdleConns + 超时释放
+### 环境搭建类（6）
 
-**G5 HTTP 响应体未关闭**
-- 注入：调 ES 后不 `defer resp.Body.Close()`
-- 症状：连接泄漏，连接数增长，端口耗尽
-- 排查：`netstat` 连接数增长
-- 根因：响应体未关闭，连接无法复用
-- 修复：`defer resp.Body.Close()` + 读空 body
+**S1 Kafka advertised.listeners 配错**：注入 容器内外地址不一致｜症状 客户端连不上超时｜排查 客户端 refused 指向 localhost｜根因 advertised 是"告诉客户端从哪连"｜修复 内外两个 listener
+**S2 ES bootstrap 失败**：注入 不调 vm.max_map_count｜症状 ES 启动即退｜排查 日志 `vm.max_map_count too low`｜根因 内核参数太小｜修复 sysctl 262144
+**S3 MySQL binlog 未开**：注入 STATEMENT 格式/未开/server-id 缺｜症状 connector 起不来｜排查 Connect 要求 ROW｜根因 CDC 依赖 ROW binlog｜修复 ROW + server-id + 复制账号
+**S4 Connector 配置错**：注入 连接串/账号错或 server-id 冲突｜症状 FAILED 循环｜排查 `/connectors/{name}/status`｜根因 配置不匹配｜修复 核对配置、server-id 唯一
+**S5 Docker 网络不通**：注入 服务间用 localhost｜症状 连接拒绝｜排查 容器内 curl 探测｜根因 localhost 指容器自己｜修复 用服务名互访
+**S6 Redis 持久化缺失**：注入 无 RDB/AOF 或配错｜症状 重启缓存/榜单/布隆全丢｜排查 重启前后 DBSIZE｜根因 未配持久化｜修复 按场景配 RDB+AOF
 
-### ES 类（2）
+### MySQL 性能类（6）
 
-**E1 索引不一致**
-- 注入：indexer 处理一半 `kill -9`
-- 症状：搜索漏结果，ES 文档数 < MySQL 行数
-- 排查：ES count vs MySQL count
-- 根因：崩溃且 offset 未提交，处理过的没重放
-- 修复：处理+写 ES+提交 offset 顺序正确且幂等，可安全重放
+**M1 缺索引慢查询**：注入 百万行按无索引列查｜症状 毫秒变秒级｜排查 EXPLAIN type=ALL｜根因 全表扫｜修复 建索引（注意最左前缀）
+**M2 深分页**：注入 LIMIT 1000000,10｜症状 越翻越慢｜排查 EXPLAIN 扫描行数=offset+limit｜根因 跳过百万行｜修复 游标/延迟关联
+**M3 回表过多**：注入 SELECT * 非覆盖｜症状 索引快但整体慢｜排查 EXPLAIN 无 Using index｜根因 二级索引回聚簇｜修复 覆盖索引/减列
+**M4 隐式类型转换**：注入 字符串列用数字查｜症状 索引失效全表扫｜排查 EXPLAIN 索引未生效｜根因 列上隐式转换｜修复 类型一致
+**M5 前导通配符**：注入 LIKE '%x%'｜症状 全表扫秒级｜排查 索引失效｜根因 前导模糊无法用 B+Tree｜修复 交给 ES 倒排（链路 A 价值）
+**M6 JSON_EXTRACT 直接 where**：注入 `WHERE JSON_EXTRACT(sale_props,'$.color')=...`｜症状 筛选慢查询｜排查 EXPLAIN 全表扫、无索引｜根因 JSON 只存不查｜修复 倒排层（product_attr_index/ES）或 generated column
 
-**E2 刷新延迟搜不到**
-- 注入：`refresh_interval` 调大（30s），写入后立刻搜
-- 症状：刚上架商品立刻搜不到，几秒后才出现
-- 排查：写入后 `_count` vs 实际搜索差异
-- 根因：ES 写入先入 buffer，refresh 后才可搜
-- 修复：理解 refresh 语义；必要场景 `refresh=true`
+### 业务/架构类（3）
 
-### 环境搭建类（6，新增）
+**B1 Kafka 分区倾斜**：注入 高 zipf 造数｜症状 单分区 lag 暴涨其余空载｜排查 inspector 看每分区消息数｜根因 key 分布不均｜修复 key 加盐/二次路由
+**B2 超时扫描器失效**：注入 注释 ticker / 条件写错｜症状 超时订单永远 CREATED 库存被占｜排查 滞留 CREATED 数增长｜根因 后台任务失效无监控｜修复 恢复 + 滞留数告警
+**B3 支付/取消竞态**：注入 状态迁移改非条件更新｜症状 已取消被置 PAID 或反之｜排查 并发 pay/cancel 状态异常｜根因 无乐观锁｜修复 条件更新 + 检查 affected rows
 
-**S1 Kafka advertised.listeners 配错**
-- 注入：容器内外地址不一致（把 `localhost:9092` 配给容器内消费者）
-- 症状：broker 返回给客户端的地址连不上，客户端全部超时
-- 排查：客户端日志「Connection refused」指向 localhost；`kafka-topics` 报 leader 不可用
-- 根因：advertised.listeners 是"告诉客户端从哪连我"的地址，容器内外不通用
-- 修复：内外分离两个 listener（内网用服务名、外网用宿主机 IP）
+### 商品中心类（6，新增）
 
-**S2 ES bootstrap 检查失败**
-- 注入：宿主机 `vm.max_map_count` 不调（Windows/WSL2 常见）
-- 症状：ES 容器启动即退，日志报 bootstrap checks failed
-- 排查：容器日志 `max virtual memory areas vm.max_map_count [65530] is too low`
-- 根因：ES 内存映射要求内核参数，默认值太小
-- 修复：`sysctl -w vm.max_map_count=262144`（WSL2 里）/ 挂载调整
+**B4 发布接口无幂等键**：注入 去掉 client_req_id 的 SETNX 抢占｜症状 网络重试生成两套 SKU｜排查 同请求两次 → sku 行翻倍｜根因 重复提交各执行一次｜修复 `SET idempotency:{merchant}:{req_id} NX EX 86400`
+**B5 唯一键焊死撞键**：注入 spu 唯一键去掉 merchant_id｜症状 第二家发布同款撞键失败｜排查 duplicate entry；两商家 key_hash 同｜根因 标品与商家货焊死｜修复 唯一键带 merchant_id；平台归一用普通索引+异步归并
+**B6 笛卡尔积爆炸**：注入 去掉发布护栏｜症状 20×15×10=3000 SKU 拖垮链路｜排查 单 spu 的 sku 行数暴涨｜根因 组合数无上限｜修复 维度≤3、每维≤50 护栏
+**B7 枚举文本改名漏数**：注入 sale_props 存文本 + 运营改名｜症状 筛新名漏历史 SKU｜排查 筛选结果骤减；ES term 不匹配｜根因 文本改名即失联｜修复 存 vid 文本仅展示；改名只改 enum_values
+**B8 热点预扣漂移**：注入 预扣异步落库失败/关对账｜症状 超卖或库存锁死｜排查 Redis 已扣 vs MySQL frozen 比对｜根因 乐观放行无对账｜修复 定期对账 + 下单二次校验 + 超卖拒绝退款
+**B9 详情页缓存精确库存**：注入 缓存精确 int 长 TTL｜症状 详情显示旧库存，下单失败｜排查 详情数字 vs MySQL 实际｜根因 强一致字段做长缓存｜修复 只缓存三态短 TTL；精确值查 MySQL
 
-**S3 MySQL binlog 未开/格式不对**
-- 注入：`binlog_format` 是 STATEMENT 或未开 binlog、server-id 未设
-- 症状：Debezium connector 启动失败，捕获不到任何变更
-- 排查：Connect 日志要求 binlog ROW；`SHOW VARIABLES LIKE 'binlog%'`
-- 根因：CDC 依赖 ROW 格式 binlog 与唯一 server-id
-- 修复：`binlog_format=ROW` + `server-id=1` + 复制账号权限
+## 13. 硬件极限与边界
 
-**S4 Debezium connector 配置错误**
-- 注入：连接串/账号密码/`database.history` 配错，或两个 connector 抢同一 server-id
-- 症状：connector 反复 FAILED/RUNNING 循环
-- 排查：Connect REST `/connectors/{name}/status` 与日志
-- 根因：配置项不匹配或 server-id 冲突
-- 修复：核对连接参数；不同 connector 用不同 server-id
-
-**S5 Docker 网络不通**
-- 注入：服务间用 `localhost:3306` 而非容器名 `mysql:3306`
-- 症状：服务起不来，连接拒绝
-- 排查：容器内 `curl` 探测；compose 网络隔离
-- 根因：localhost 指容器自己，不是宿主机
-- 修复：compose 内用服务名互访，宿主机访问才用 localhost
-
-**S6 Redis 持久化配置缺失**
-- 注入：纯内存无 RDB/AOF，或 AOF 配置错误
-- 症状：重启 Redis 后缓存/计数/布隆位图全丢
-- 排查：重启前后 `DBSIZE` 对比；`config get save/appendonly`
-- 根因：未配置持久化或策略不当
-- 修复：按场景配 RDB 快照 + AOF；缓存类数据可接受丢，计数/位图不能
-
-### MySQL 性能类（5，新增）
-
-**M1 缺索引慢查询**
-- 注入：百万行表上按无索引列查询（如 `WHERE title LIKE 'x%'` 且 title 无索引，或按未索引列等值查）
-- 症状：查询从毫秒变秒级，接口超时
-- 排查：`EXPLAIN` 看 `type=ALL` 全表扫、`rows` 百万级
-- 根因：无可用索引，全表扫描
-- 修复：按查询模式建索引（注意最左前缀）
-
-**M2 深分页**
-- 注入：`LIMIT 1000000, 10` 翻页
-- 症状：越往后翻越慢，甚至秒级/超时
-- 排查：`EXPLAIN` 看扫描行数 = offset+limit
-- 根因：MySQL 需跳过前面 100 万行
-- 修复：游标分页（`WHERE id > last_id LIMIT 10`）/ 延迟关联
-
-**M3 回表过多**
-- 注入：`SELECT *` 且索引不含所需列
-- 症状：索引扫描快但整体仍慢，CPU 高
-- 排查：`EXPLAIN` 看 `Using index condition` 缺失、`rows` 与回表次数
-- 根因：二级索引只存键，取完整行要回聚簇索引
-- 修复：覆盖索引（索引含 SELECT 列）/ 减少返回列
-
-**M4 隐式类型转换索引失效**
-- 注入：字符串列（如 order_no）用数字查：`WHERE order_no = 123456`
-- 症状：走了全表扫，慢查询
-- 排查：`EXPLAIN` 索引没生效；MySQL 对列做了类型转换
-- 根因：列上发生隐式转换，无法用索引
-- 修复：查询值类型与列一致（加引号）
-
-**M5 前导通配符索引失效**
-- 注入：`LIKE '%关键词%'` 搜商品
-- 症状：全表扫，百万行表秒级响应
-- 排查：`EXPLAIN` 索引失效；B+ 树无法用前导未知的模糊匹配
-- 根因：前导通配符无法利用 B+ 树有序性
-- 修复：这就是**搜索为什么交给 ES 倒排索引**（呼应链路 A）；轻量场景可用前缀索引/全文索引
-
-### 业务/架构类（3，新增）
-
-**B1 Kafka 分区倾斜**
-- 注入：load-gen 用高 zipf 系数造数（少数热 key 占大头）
-- 症状：单分区 lag 暴涨，其它分区几乎空载；部分消费者忙死部分闲死
-- 排查：kafka-inspector 看每分区消息数/lag 分布
-- 根因：key 分布不均，hash 后少数分区承载绝大部分流量
-- 修复：key 加盐/二次路由（生产）；理解"分区是并行上限"的代价
-
-**B2 超时扫描器失效**
-- 注入：把扫描器 ticker 注释掉，或扫描条件写错（如 `>` 写成 `<`）
-- 症状：超时订单永远停在 CREATED，库存被永久占用
-- 排查：观察超过超时窗口的 CREATED 订单数持续增长
-- 根因：后台任务失效且无监控
-- 修复：恢复扫描器 + 加"滞留订单数"指标告警
-
-**B3 支付/取消竞态**
-- 注入：状态迁移改非条件更新（`UPDATE orders SET status='PAID'` 不带 `WHERE status='CREATED'`）
-- 症状：并发支付+取消时，已取消订单被置为 PAID 或反之，库存/积分错乱
-- 排查：压测同时发 pay 和 cancel，观察状态异常迁移
-- 根因：无乐观锁，后写覆盖先写
-- 修复：条件更新（`WHERE status='CREATED'`）+ 检查 affected rows
-
-## 12. 硬件极限与边界（诚实版）
-
-**32G 单机天花板**（D 盘剩余 388G，磁盘不是瓶颈）：
-
-| 资源 | 极限 |
+| 资源 | 32G 单机极限（D 盘余 388G） |
 |---|---|
-| MySQL | 千万行级（每百万行约百 MB–GB） |
-| Kafka | 百万级消息、单 broker 十万级 msg/s（小消息） |
-| ES | 单节点 5M–20M 文档（heap 2–4G） |
+| MySQL | 千万行级 |
+| Kafka | 百万级消息、单 broker 十万级 msg/s |
+| ES | 单节点百万级 SKU 文档（heap 2–4G；百万级已接近单节点舒适区上沿，可调 `--count` 控制） |
 | Redis | 百万级 key |
-| 并发 | Go 服务数千 QPS |
+| 并发 | 数千 QPS |
 
-**能忠实模拟的**：架构模式、故障模式、性能现象（索引失效/缓存击穿/分区倾斜/rebalance/连接池耗尽）、调优手法——这些在百万级、千 QPS 下就会真实显现，不需要生产规模。
-**模拟不了的**：跨机房网络分区、真多机物理资源隔离（k3s 阶段可模拟编排逻辑，但共享同一台物理机）。
+能忠实模拟：架构、故障模式、性能现象（索引失效/击穿/倾斜/rebalance/连接池耗尽/单行热点）、调优手法——百万级即显现。模拟不了：跨机房分区、真多机物理隔离（k3s 阶段补编排逻辑）。
 
-## 13. 参数手册约定（贯穿所有代码）
+## 14. 参数手册约定
 
-每个参数/代码块的注释模板：
+每个参数/代码块注释模板：`做什么 / 实现的需求 / 防止的问题(bug 编号) / 改错的后果`。实现阶段所有代码与配置按此编写；docs/learning/parameters.md 维护「参数速查表」。
 
-```go
-// 参数/这段代码做什么
-// 实现的需求：xxx（链路/功能的哪一部分）
-// 防止的问题：xxx（bug 编号交叉引用）
-// 改错的后果：改成什么值会复现哪个 bug
-```
-
-实现阶段所有 Go 代码、compose 配置、中间件配置都按此约定编写；同时在 `docs/learning/` 维护一份「参数速查表」，汇总所有关键参数与其对应 bug 编号。
-
-## 14. 学习材料计划（docs/learning/）
+## 15. 学习材料计划（docs/learning/）
 
 | 材料 | 内容 |
 |---|---|
-| `bloom-filter.md` | 布隆过滤器原理推导（m/k/误判率公式）+ Go 手搓实现逐步讲解 |
-| `inverted-index.md` | 倒排索引原理（分词、倒排表、相关性排序）+ ES 对应概念映射 |
-| `kafka-quickstart.md` | KRaft 快速上手（topic/分区/消费组/lag 实操） |
-| `es-quickstart.md` | ES 上手（索引/映射/查询 DSL） |
-| `prometheus-grafana.md` | 监控栈上手（阶段二） |
-| `parameters.md` | 参数速查表（参数 → 需求 → bug 编号） |
+| `product-center.md` | 场景题精讲：逐段对应到 demo 代码与表（"这个 DDL 为什么这样"） |
+| `bloom-filter.md` | 布隆原理推导 + Go 手搓逐步讲解 |
+| `inverted-index.md` | 倒排索引原理（分词/倒排表/相关性）+ ES 映射 |
+| `redis-zset.md` | ZSET 跳表原理 + 榜单实战 |
+| `kafka-quickstart.md` / `es-quickstart.md` | 中间件上手（用户首次使用，手把手） |
+| `prometheus-grafana.md` | 监控栈（阶段二） |
+| `parameters.md` | 参数速查表（参数→需求→bug 编号） |
 
-## 15. 部署
+## 16. 部署
 
 ### 阶段一：本地 Docker Compose
 
-- 服务：mysql、kafka(KRaft)、kafka-connect(debezium)、elasticsearch、redis、5 个 Go 服务、load-gen/kafka-inspector（按需运行）、chaos.sh。
-- **第一步是拉镜像**（用户尚无 Kafka/ES 等镜像）：kafka、kafka-connect+debezium、elasticsearch、grafana、prometheus，共约 3–5GB。
-- MySQL 初始化：`init.sql` 建表；`my.cnf` 开 `binlog_format=ROW`、`server-id`；Debezium 复制账号。
+- mysql、kafka(KRaft)、kafka-connect(debezium)、elasticsearch、redis、5 个 Go 服务、load-gen/kafka-inspector、chaos.sh。
+- **第一步拉镜像**（用户尚无）：kafka、kafka-connect+debezium、elasticsearch、grafana、prometheus，约 3–5GB。
+- MySQL：init.sql 建表 + seed.sql 种子（类目/属性 meta/枚举值）；my.cnf 开 binlog ROW + server-id；复制账号。
 
-### 阶段二：k3s + 可观测
+### 阶段二：k3s + 可观测（单独出 spec）
 
-- k3s 跑在 WSL2 / Linux VM（Windows 不能原生跑 k3s）。
-- 各服务 Deployment；order-worker 多副本演示 rebalance/HPA。
-- Prometheus（`promhttp` 暴露 `/metrics`）+ Grafana 面板；Kafka lag、Redis、ES 指标接入。
+## 17. 验证与演练方法
 
-## 16. 验证与演练方法
+1. **正常流**：发布商品（走元数据校验+SKU 生成）→ CDC → 可搜索（facet 筛选正确）→ 下单 → 支付 → 扣库存/销量榜/积分。
+2. **状态机**：超时自动取消、支付失败重试、重复支付幂等、库存回补。
+3. **rebalance**：order-worker 2 实例 kill 一个。
+4. **混沌**：chaos.sh 随机杀服务。
+5. **压测**：burst 突发流量 → 堆积/倾斜/连接池。
+6. **性能 lab**：百万行 EXPLAIN 专项（含 JSON_EXTRACT vs 倒排对比）。
+7. **演进 drill**：热点 SKU 压出单行瓶颈 → 实现 Redis Lua 预扣（frozen_stock+对账）。
+8. **故障演练**：50 个 bug 挑着注入 → 观察 → 排查 → 修复 → 对照核对。
 
-1. **正常流**：造商品 → 搜索命中（缓存生效）→ 下单 → 支付 → 扣库存/加积分。
-2. **状态机**：下单 → 等超时 → 自动取消 → 库存回补；支付失败重试；重复支付幂等。
-3. **rebalance**：order-worker 起 2 实例，kill 一个，观察分区重分配。
-4. **混沌**：`chaos.sh` 随机杀服务，观察系统如何（不）自我恢复。
-5. **压测**：burst 突发流量 → 观察堆积/缓存/连接池/倾斜。
-6. **性能 lab**：百万行表 EXPLAIN 专项练习。
-7. **故障演练**：从第 11 节挑 bug → 注入 → 观察 → 排查 → 修复 → 对照核对。
+## 18. 待办 / 后续
 
-## 17. 待办 / 后续
-
-- 阶段一落地后，单独出阶段二（k3s + Prometheus/Grafana）的 spec。
-- 学习材料随实现进度逐步撰写。
+- 阶段一落地后，单独出阶段二（k3s + Prometheus/Grafana）spec。
+- 学习材料随实现进度撰写。
