@@ -6,14 +6,21 @@
 
 **Architecture:** Docker Compose 编排 5 个中间件容器；MySQL 开 binlog(ROW) 并预置 6 张表 + 种子类目/属性元数据；Kafka 单节点 KRaft，容器内/宿主机双 listener（教学 S1）；Debezium Connect 用 RegexRouter 把 4 张表的变更统一路由到 `product.changed`；ES 单节点 heap 1g；Redis 512mb + RDB/AOF 双持久化。开发期 Go 服务跑宿主机，中间件跑 Docker。
 
-**Tech Stack:** Docker Compose、MySQL 8.0、bitnami/kafka:3.6（KRaft）、debezium/connect:2.5、Elasticsearch 8.13.4、redis:7
+**Tech Stack:** Docker Compose、MySQL 8.0.36、apache/kafka:4.2.0（KRaft，本机已有）、debezium/connect:2.5、Elasticsearch 8.13.4、redis:7.4.9-alpine（本机已有）
+
+## 执行期调整记录（2026-10-28 环境探测后）
+
+1. **镜像换本机已有**（省约 1.4GB 下载）：`bitnami/kafka:3.6` → `apache/kafka:4.2.0`（官方镜像，KRaft，4.x 已彻底移除 ZooKeeper）；`redis:7` → `redis:7.4.9-alpine`。
+2. **Kafka CLI 无 `.sh` 后缀**（Kafka 4.x 完成 KIP-884）：全文 `kafka-topics.sh`→`kafka-topics`、`kafka-console-consumer.sh`→`kafka-console-consumer`。
+3. **端口避让本机占用**：探测发现 3306=本机原生 mysqld.exe（Windows 服务）、6379=其它项目 Redis 容器 → demo 改映射 **MySQL 13306:3306、Redis 16379:6379**（容器内端口不变，服务间互访用服务名不受影响；Go 服务在宿主机侧连 13306/16379）。9200/8083/9094 空闲照旧。
+4. `mysql:8.0` 钉死为 `mysql:8.0.36`。
 
 ## 全局约束（全项目 5 个计划通用，逐条来自 spec）
 
 - 所有 Go 服务**独立 module + 独立 Dockerfile**，不允许共用一个 go.mod（用户硬性要求）。
 - 代码/配置注释约定：每块注释写「做什么 / 实现的需求 / 防止的问题(bug 编号) / 改错的后果」。
 - 内存预算：全栈 ≤12GB——ES heap 1g、MySQL buffer 2G、Kafka 1g、Connect 1g、Redis 512mb。
-- 端口：MySQL 3306、Kafka 宿主机 9094（容器内 9092）、Connect 8083、ES 9200、Redis 6379；Go 服务 8080/8081/8082。
+- 端口（宿主侧）：MySQL **13306**、Redis **16379**（本机 3306/6379 被原生 mysqld 与其它项目占用）、Kafka 9094（容器内 9092）、Connect 8083、ES 9200；Go 服务 8080/8081/8082。容器内端口不变。
 - Kafka topic：`product.changed`、`order.events`，均 3 分区（`auto.create.topics.enable=false`，显式创建）。
 - MySQL：库 `demo`；凭据**三处一致**（`.env` 记录 / `init.sql` 建账号 / connector JSON 连接）——学习项目明文硬编码，改密码三处同步，生产换 secrets 注入。
 - 默认数据量：SPU 10 万 / SKU 50 万 / orders 100 万（load-gen 可调，计划 2 落地）。
