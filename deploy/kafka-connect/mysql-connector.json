@@ -14,9 +14,11 @@
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
     "decimal.handling.mode": "double",
     "snapshot.mode": "initial",
+    "include.schema.changes": "false",
     "transforms": "route",
-    "transforms.route.type": "org.apache.kafka.connect.transforms.RegexRouter",
-    "transforms.route.regex": "demo.demo.(category|attribute_meta|spu|sku)",
-    "transforms.route.replacement": "product.changed"
+    "transforms.route.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.route.topic.regex": "demo.demo.(category|attribute_meta|spu|sku)",
+    "transforms.route.topic.replacement": "product.changed",
+    "transforms.route.key.enforce.uniqueness": "false"
   }
 }
