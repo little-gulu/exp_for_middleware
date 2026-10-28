@@ -6,6 +6,8 @@ bin/
 
 # 环境变量 / 密钥
 .env
+# 学习项目例外：deploy/.env 仅 demo 凭据清单，随仓库提交（见计划1全局约束）
+!deploy/.env
 *.local
 
 # IDE
