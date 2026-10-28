@@ -1,0 +1,22 @@
+# Go
+bin/
+*.exe
+*.test
+*.out
+
+# 环境变量 / 密钥
+.env
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 数据卷（本地造数产物）
+data/
+volumes/
+
+# 系统
+.DS_Store
+Thumbs.db

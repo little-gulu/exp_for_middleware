@@ -1,0 +1,283 @@
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<title>KRaft Kafka 架构</title>
+<style>
+  :root {
+    --bg: #f6f4ef;
+    --panel: #fdfcf9;
+    --fg: #1c1d1f;
+    --muted: #6b6d72;
+    --line: #d9d6cd;
+    --data: #2a62a8;
+    --data-soft: #eaf1f9;
+    --meta: #a35e0e;
+    --meta-soft: #faf2e3;
+    --on-accent: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141518;
+      --panel: #1d1e22;
+      --fg: #e8e6e1;
+      --muted: #9b9da3;
+      --line: #34353a;
+      --data: #6fa5e0;
+      --data-soft: #1a222e;
+      --meta: #e0a64a;
+      --meta-soft: #251d10;
+      --on-accent: #141518;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141518;
+    --panel: #1d1e22;
+    --fg: #e8e6e1;
+    --muted: #9b9da3;
+    --line: #34353a;
+    --data: #6fa5e0;
+    --data-soft: #1a222e;
+    --meta: #e0a64a;
+    --meta-soft: #251d10;
+    --on-accent: #141518;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1060px;
+    margin: 0 auto;
+    padding: 48px 24px 72px;
+  }
+  .mono { font-family: "IBM Plex Mono", "SF Mono", Consolas, monospace; }
+
+  h1 {
+    font-size: 30px;
+    line-height: 1.2;
+    font-weight: 700;
+    margin: 0 0 8px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .lede {
+    font-size: 16px;
+    color: var(--muted);
+    max-width: 62ch;
+    margin: 0 0 32px;
+  }
+  .lede code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.9em;
+    color: var(--fg);
+  }
+
+  figure {
+    margin: 0 0 28px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 20px 16px 14px;
+  }
+  figure svg { display: block; width: 100%; height: auto; }
+  figcaption {
+    font-size: 14px;
+    color: var(--muted);
+    padding: 12px 8px 0;
+    max-width: 72ch;
+  }
+
+  .guide h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 0 0 14px;
+  }
+  .guide ol {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 12px;
+  }
+  .guide li {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    font-size: 15px;
+    max-width: 70ch;
+  }
+  .guide .n {
+    flex: 0 0 auto;
+    width: 24px; height: 24px;
+    border-radius: 50%;
+    background: var(--data-soft);
+    color: var(--data);
+    font-family: "IBM Plex Mono", monospace;
+    font-weight: 600;
+    font-size: 13px;
+    display: grid; place-items: center;
+  }
+  .guide li:nth-child(n+3) .n { background: var(--meta-soft); color: var(--meta); }
+  .guide b { font-weight: 600; }
+  .guide code {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.88em;
+  }
+
+  /* ——— SVG element styles ——— */
+  .node { fill: var(--panel); stroke: var(--line); stroke-width: 1.4; }
+  .band-data { fill: var(--data-soft); }
+  .band-meta  { fill: var(--meta-soft); }
+  .t-title  { font-family: "IBM Plex Mono", monospace; font-weight: 600; fill: var(--fg); }
+  .t-sub    { fill: var(--muted); }
+  .t-data   { fill: var(--data); }
+  .t-meta   { fill: var(--meta); }
+
+  .leader-rect   { fill: var(--data); stroke: var(--data); }
+  .leader-text   { fill: var(--on-accent); }
+  .follower-rect { fill: var(--panel); stroke: var(--data); stroke-width: 1.2; }
+  .follower-text { fill: var(--data); }
+
+  .active-rect   { fill: var(--meta); stroke: var(--meta); }
+  .active-text   { fill: var(--on-accent); }
+  .standby-rect  { fill: var(--panel); stroke: var(--meta); stroke-width: 1.2; }
+  .standby-text  { fill: var(--meta); }
+
+  .arrow-data { stroke: var(--data); stroke-width: 1.6; fill: none; }
+  .arrow-meta { stroke: var(--meta); stroke-width: 1.6; fill: none; }
+  .arrow-ghost { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 4 4; }
+  .strike { text-decoration: line-through; }
+
+  @media (max-width: 640px) {
+    h1 { font-size: 24px; }
+  }
+</style>
+
+<div class="wrap">
+  <h1>KRaft：Kafka 的无 ZooKeeper 架构</h1>
+  <p class="lede">新版本 Kafka 用一套 <code>controller</code> 节点（Raft 共识）替代了 ZooKeeper。记住这张图就抓住了一个核心：<b>数据走 Broker，元数据走 Controller——两条平面，各走各的。</b></p>
+
+  <figure>
+    <svg viewBox="0 0 1080 660" role="img" aria-label="KRaft 架构图：数据平面由生产者经 Broker 到消费者，元数据平面由 controller 组成的 Raft 集群管理，替代了旧版 ZooKeeper">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/>
+        </marker>
+      </defs>
+
+      <!-- 图例 -->
+      <rect x="40" y="17" width="14" height="14" rx="3" class="leader-rect"/>
+      <text x="62" y="29" font-size="12.5" class="t-sub">数据平面</text>
+      <rect x="136" y="17" width="14" height="14" rx="3" class="active-rect"/>
+      <text x="158" y="29" font-size="12.5" class="t-sub">元数据平面</text>
+      <rect x="250" y="17" width="14" height="14" rx="3" class="leader-rect"/>
+      <text x="272" y="29" font-size="12.5" class="t-sub">实心 = 主 / active</text>
+      <rect x="412" y="17" width="14" height="14" rx="3" class="follower-rect"/>
+      <text x="434" y="29" font-size="12.5" class="t-sub">空心 = 从 / standby</text>
+
+      <!-- ============ 数据平面 ============ -->
+      <rect x="20" y="48" width="1040" height="292" rx="12" class="band-data"/>
+      <text x="36" y="76" font-size="13" font-weight="700" class="t-data">数据平面 · 消息流经 Broker</text>
+
+      <!-- 生产者 -->
+      <rect x="40" y="168" width="130" height="92" rx="8" class="node"/>
+      <text x="105" y="200" font-size="13" class="t-title" text-anchor="middle">Producer</text>
+      <text x="105" y="224" font-size="12" class="t-sub" text-anchor="middle">生产者</text>
+
+      <!-- 消费者 -->
+      <rect x="910" y="168" width="130" height="92" rx="8" class="node"/>
+      <text x="975" y="200" font-size="13" class="t-title" text-anchor="middle">Consumer</text>
+      <text x="975" y="224" font-size="12" class="t-sub" text-anchor="middle">消费者</text>
+
+      <!-- Broker 1 -->
+      <rect x="210" y="78" width="190" height="242" rx="8" class="node"/>
+      <text x="305" y="106" font-size="13" class="t-title" text-anchor="middle">Broker 1</text>
+      <rect x="230" y="124" width="150" height="38" rx="6" class="leader-rect"/>
+      <text x="305" y="148" font-size="12.5" class="leader-text mono" text-anchor="middle">P0 · 主</text>
+      <rect x="230" y="176" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="305" y="200" font-size="12.5" class="follower-text mono" text-anchor="middle">P1 · 从</text>
+      <rect x="230" y="228" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="305" y="252" font-size="12.5" class="follower-text mono" text-anchor="middle">P2 · 从</text>
+
+      <!-- Broker 2 -->
+      <rect x="445" y="78" width="190" height="242" rx="8" class="node"/>
+      <text x="540" y="106" font-size="13" class="t-title" text-anchor="middle">Broker 2</text>
+      <rect x="465" y="124" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="540" y="148" font-size="12.5" class="follower-text mono" text-anchor="middle">P0 · 从</text>
+      <rect x="465" y="176" width="150" height="38" rx="6" class="leader-rect"/>
+      <text x="540" y="200" font-size="12.5" class="leader-text mono" text-anchor="middle">P1 · 主</text>
+      <rect x="465" y="228" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="540" y="252" font-size="12.5" class="follower-text mono" text-anchor="middle">P2 · 从</text>
+
+      <!-- Broker 3 -->
+      <rect x="680" y="78" width="190" height="242" rx="8" class="node"/>
+      <text x="775" y="106" font-size="13" class="t-title" text-anchor="middle">Broker 3</text>
+      <rect x="700" y="124" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="775" y="148" font-size="12.5" class="follower-text mono" text-anchor="middle">P0 · 从</text>
+      <rect x="700" y="176" width="150" height="38" rx="6" class="follower-rect"/>
+      <text x="775" y="200" font-size="12.5" class="follower-text mono" text-anchor="middle">P1 · 从</text>
+      <rect x="700" y="228" width="150" height="38" rx="6" class="leader-rect"/>
+      <text x="775" y="252" font-size="12.5" class="leader-text mono" text-anchor="middle">P2 · 主</text>
+
+      <!-- 数据流箭头 -->
+      <line x1="170" y1="214" x2="206" y2="214" class="arrow-data" marker-end="url(#arr)"/>
+      <text x="188" y="205" font-size="12" class="t-data" text-anchor="middle">发送数据</text>
+      <line x1="874" y1="214" x2="906" y2="214" class="arrow-data" marker-end="url(#arr)"/>
+      <text x="890" y="205" font-size="12" class="t-data" text-anchor="middle">消费数据</text>
+
+      <!-- ============ 元数据平面 ============ -->
+      <rect x="20" y="420" width="1040" height="182" rx="12" class="band-meta"/>
+      <text x="36" y="448" font-size="13" font-weight="700" class="t-meta">元数据平面 · 由 Controller 管理（Raft）</text>
+
+      <!-- 连接 broker 与 active controller 的元数据请求 -->
+      <line x1="305" y1="320" x2="305" y2="466" class="arrow-meta" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <text x="296" y="384" font-size="12" class="t-meta" text-anchor="end">元数据请求</text>
+      <text x="296" y="401" font-size="11" class="t-sub" text-anchor="end">建 topic · 选 leader</text>
+
+      <!-- ZooKeeper（旧版，已移除） -->
+      <rect x="30" y="470" width="140" height="122" rx="8" fill="var(--panel)" class="arrow-ghost" opacity="0.55"/>
+      <text x="100" y="512" font-size="13" class="t-title strike mono" text-anchor="middle" opacity="0.7">ZooKeeper</text>
+      <text x="100" y="540" font-size="11" class="t-sub" text-anchor="middle">旧版 · 已被 Raft 取代</text>
+
+      <!-- Controller 1（active） -->
+      <rect x="210" y="470" width="190" height="122" rx="8" class="active-rect"/>
+      <text x="305" y="502" font-size="13" class="active-text mono" font-weight="600" text-anchor="middle">Controller 1</text>
+      <text x="305" y="530" font-size="12" class="active-text" text-anchor="middle">active · 在职</text>
+
+      <!-- Controller 2（standby） -->
+      <rect x="445" y="470" width="190" height="122" rx="8" class="standby-rect"/>
+      <text x="540" y="502" font-size="13" class="standby-text mono" font-weight="600" text-anchor="middle">Controller 2</text>
+      <text x="540" y="530" font-size="12" class="standby-text" text-anchor="middle">standby · 待命</text>
+
+      <!-- Controller 3（standby） -->
+      <rect x="680" y="470" width="190" height="122" rx="8" class="standby-rect"/>
+      <text x="775" y="502" font-size="13" class="standby-text mono" font-weight="600" text-anchor="middle">Controller 3</text>
+      <text x="775" y="530" font-size="12" class="standby-text" text-anchor="middle">standby · 待命</text>
+
+      <!-- Raft 复制箭头 -->
+      <line x1="404" y1="532" x2="440" y2="532" class="arrow-meta" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <line x1="639" y1="532" x2="676" y2="532" class="arrow-meta" marker-start="url(#arr)" marker-end="url(#arr)"/>
+      <text x="542" y="618" font-size="12" class="t-meta" text-anchor="middle">Raft 复制元数据日志（active ↔ standby）</text>
+    </svg>
+    <figcaption>KRaft 把 Kafka 拆成两条互不干扰的平面：蓝色数据平面（消息走 Broker 的分区副本，读写只打 Leader），琥珀色元数据平面（Controller 组成 Raft 投票团，只有一个 active 在职，元数据日志在它们之间复制多份）。右下被划掉的 ZooKeeper，就是旧版里干「元数据」这活的，现在被这套 Controller 取代。</figcaption>
+  </figure>
+
+  <div class="guide">
+    <h2>怎么读这张图</h2>
+    <ol>
+      <li><span class="n">1</span><span><b>两条平面，各走各的。</b>生产者/消费者<b>只碰 Broker</b>，永远不直接找 Controller；Broker 需要元数据（建 topic、选分区 leader）时才去问 <code>active controller</code>。</span></li>
+      <li><span class="n">2</span><span><b>副本分散、Leader 唯一。</b>每个分区（P0/P1/P2）在 3 个 Broker 上各有一份副本，但只有一个是「主」，读写都打到主，其余「从」只同步。这就是之前说的「一 broker 一机 + 副本跨机」。</span></li>
+      <li><span class="n">3</span><span><b>Controller 是投票团，不是单个机器。</b>3 个 controller 组成 Raft，只有 <code>Controller 1</code>（active）在职，其余 standby。元数据日志靠 Raft 复制多份，active 挂了 standby 立即接班。</span></li>
+      <li><span class="n">4</span><span><b>ZooKeeper 彻底消失。</b>旧版里 ZooKeeper 负责存元数据、选 controller；新版把这活儿内建进 Kafka 自己的 Controller quorum，少一层外部依赖。</span></li>
+    </ol>
+  </div>
+</div>
