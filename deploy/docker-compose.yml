@@ -98,6 +98,11 @@ services:
       - discovery.type=single-node
       - xpack.security.enabled=false   # 学习环境关安全认证，生产必须开
       - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      # CORS：elasticvue 是纯前端应用，浏览器直连 ES 需要跨域放行（学习环境开 *，生产收紧）
+      # 注意 allow-origin 的 * 必须带引号：裸 * 写进 elasticsearch.yml 会被当成 YAML 别名 → 启动崩溃
+      - http.cors.enabled=true
+      - 'http.cors.allow-origin="*"'
+      - 'http.cors.allow-headers=Authorization,X-Requested-With,Content-Type,Content-Length'
     volumes:
       - es-data:/usr/share/elasticsearch/data
     healthcheck:
@@ -126,6 +131,26 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+
+  # Kafka 网页控制台：topic/分区/消息/消费组/lag 可视化
+  # bootstrap 用 kafka:9092（容器内地址）——若填 localhost:9094 会连到它自己，即 bug S1 的活例子
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: demo-kafka-ui
+    ports:
+      - "8088:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=demo
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  # ES 网页控制台（轻量版 Kibana）：索引浏览 + 查询控制台
+  elasticvue:
+    image: cars10/elasticvue:latest
+    container_name: demo-elasticvue
+    ports:
+      - "8089:8080"
 
 volumes:
   mysql-data:

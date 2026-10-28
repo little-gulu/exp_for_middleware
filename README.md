@@ -53,6 +53,10 @@ docker exec demo-mysql mysql -uroot -proot123456 -e "INSERT INTO demo.category (
 docker exec demo-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic product.changed --from-beginning --max-messages 1
 ```
 
+**可视化界面**
+- Kafka UI：<http://localhost:8088>——topic/分区/消息/消费组/lag
+- Elasticvue：<http://localhost:8089>——ES 索引浏览 + 查询控制台（连接填 localhost:9200）
+
 **常用速查**
 ```bash
 docker compose ps
@@ -69,3 +73,4 @@ bash deploy/chaos.sh random     # 随机杀一个中间件，观察业务反应
 3. 单节点集群必须把内部主题副本因子降为 1（`offsets.topic.replication.factor` 等），否则 `__consumer_offsets` 创建失败、offset 提交卡死。
 4. Debezium 默认把 DDL 事件发到 `topic=<prefix>` 这个 topic；`auto.create.topics=false` 时 producer 卡死拖垮整条管线 → `include.schema.changes=false`。
 5. 删 connector 不清 offset；同名重建不会重新快照 → 换名或清 offset。
+6. ES 的 `http.cors.allow-origin=*` 裸星号写进 elasticsearch.yml 是 YAML 别名语法，启动崩溃 → 必须带引号 `"*"`。
