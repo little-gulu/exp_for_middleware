@@ -2,11 +2,30 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** product-service 发布一个商品走完「幂等键 → 元数据驱动校验 → SPU 归一 → SKU 笛卡尔积 → 落库 → 布隆置位」全链路；详情 API 走「布隆 → Redis 缓存 → MySQL」；load-gen 按种子模板批量造 SPU 10 万 / SKU 50 万。
+**Goal:** 用"商品发布/详情"这个业务背景，把 **Go 和 MySQL/Redis 组装**起来，通过一个可运行的服务体会：连接池、Redis 原子命令/bitmap/pipeline、缓存读写路径、幂等与防穿透等**中间件能力与边界**；load-gen 批量造数同时制造一条 **MySQL→binlog→CDC→Kafka** 的真实数据流供观察。
 
-**Architecture:** 单个 Go module `product-service`，stdlib `net/http`（Go 1.22+ 方法路由），`go-sql-driver/mysql` + `redis/go-redis/v9`。核心业务按 spec §5.1 拆成 `publish` 包（校验/keyhash/笛卡尔积）与 `bloom` 包（手搓布隆 + Redis bitmap）。测试直接打本机真实中间件（localhost:13306/16379），每任务 TDD。
+**背景说明（不重要，仅提供真实感）**：业务锚点是商品中心的 SPU/SKU/属性元数据模型（场景题只是把这种建模讲得最透的教材）。**任务名里的"元数据/归一/笛卡尔积"都是背景词汇**——它们只是让代码"有事可做"的载体，真正的学习对象是下表右侧的中间件能力与 Go 写法。
+
+**Architecture:** 单个 Go module `product-service`，stdlib `net/http`（Go 1.22+ 方法路由），`go-sql-driver/mysql` + `redis/go-redis/v9`。测试直接打本机真实中间件（localhost:13306/16379），每任务 TDD。
 
 **Tech Stack:** Go 1.26、net/http、go-sql-driver/mysql v1.8.1、go-redis/v9 v9.7.0
+
+## 本计划真正练什么（学习主线对照表）
+
+> 读任务列表时以本表为准：左列只是背景，右列才是本计划的目的。
+
+| 任务 | 练的中间件能力与边界 | 练的 Go 写法 | 对应 bug 卡 |
+|---|---|---|---|
+| 1 骨架 | （无）服务基础 | **优雅退出**：`signal.NotifyContext` + `Shutdown` | G3 |
+| 2 store | **MySQL**：连接池语义（max/idle/lifetime）、TINYINT 扫描 | `database/sql` 连接池参数、`rows.Scan` | G4、M1-M6 |
+| 3 校验 | （纯逻辑）演示"**数据驱动 vs 代码分支**"设计原理 | `switch` 通用分支、`errors.Is` 错误哨兵 | — |
+| 4 keyhash | （纯逻辑）确定性指纹 | `sort` + `md5` | — |
+| 5 笛卡尔积 | （纯逻辑）组合枚举 | 递归回溯 | B6 |
+| 6 幂等 | **Redis**：`SETNX NX EX` 的**原子抢占**与过期语义 | go-redis 客户端用法 | B4 |
+| 7 布隆 | **Redis**：**bitmap** `SETBIT/GETBIT` 位图能力、`Pipeline` 批量命令；误判率数学=边界在哪 | pipeline 批量 | R1、R8 |
+| 8 发布 API | **MySQL**：upsert 唯一键技巧（`ON DUPLICATE KEY UPDATE`）+ 以上全部**组装** | HTTP handler、依赖注入、JSON 编解码 | B5 |
+| 9 详情 | **Redis 缓存读写路径**：TTL 语义、cache-aside、随机过期 | 随机 TTL、缓存命中响应头 | R1、R3、R4 |
+| 10 load-gen | **MySQL binlog → CDC → Kafka 数据流**：批量写入的放大效应（Kafka UI 观察） | 批量多行 INSERT | K4、C1-C4 |
 
 ## 全局约束（同计划 1，沿用）
 
@@ -187,7 +206,7 @@ type EnumVal struct {
 }
 
 // AttributeMeta：attribute_meta 表一行 = 一条属性模板（spec §4.1）
-// 元数据驱动：业务代码只认这套通用结构，不出现"颜色/尺码"等具体属性名（场景题硬约束）
+// 元数据驱动：业务代码只认这套通用结构，不出现"颜色/尺码"等具体属性名（背景模型的约束，顺带演示"数据驱动 vs 代码分支"原理）
 type AttributeMeta struct {
 	ID         int64
 	CategoryID int64
@@ -419,7 +438,7 @@ var (
 )
 
 // Validate：元数据驱动的通用校验。
-// 核心设计（场景题总纲）：switch 只认 value_type 这类"元数据的类型"，
+// 核心设计（数据驱动 vs 代码分支的原理演示）：switch 只认 value_type 这类"元数据的类型"，
 // 代码里永远不出现 if name=="颜色" 之类的具体属性分支——新增类型=加配置，零改码。
 func Validate(metas []store.AttributeMeta, attrs []AttrValue) error {
 	byID := make(map[int64]AttrValue, len(attrs))
@@ -524,7 +543,7 @@ import (
 	"strings"
 )
 
-// KeyHash：SPU 归一的关键属性指纹（场景题 5.3）。
+// KeyHash：关键属性指纹（背景需求：同款判定）。
 // 实现的需求：判断"这是不是同一款商品"，同款复用 SPU、不同款新建。
 // 顺序无关：先按 AttrID 排序再拼接——商家提交顺序不同不影响归一。
 // 防的问题：B5 唯一键焊死（本 hash 只做候选检索；唯一约束在 (merchant_id, category_id, key_hash)）
@@ -646,7 +665,7 @@ const (
 
 var ErrComboExplode = errors.New("SKU 组合爆炸")
 
-// GenSKUs：销售属性笛卡尔积（递归回溯，场景题 5.2）
+// GenSKUs：销售属性笛卡尔积（递归回溯；背景需求：规格组合生成 SKU）
 // dims[i] = 第 i 个销售属性（如"颜色"）的所有取值
 func GenSKUs(dims [][]AttrValue) ([][]AttrValue, error) {
 	if len(dims) > maxSaleDims {
@@ -737,7 +756,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Idempotency：发布接口幂等键（场景题追问5A）。
+// Idempotency：发布接口幂等键（防网络重试重复提交）。
 // 实现的需求：网络抖动重试时，不重复生成 SKU（防 bug B4——去掉抢占即可复现"重试生成两套 SKU"）。
 // 机制：SET key 1 NX EX 86400 原子抢占——NX=不存在才写；抢占失败=重复请求，返回首次结果。
 type Idempotency struct{ rdb *redis.Client }
