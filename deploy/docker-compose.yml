@@ -48,8 +48,11 @@ services:
       # 关自动建 topic：强制显式创建（教学 kafka-topics 用法）
       - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
       - KAFKA_HEAP_OPTS=-Xms512m -Xmx1g
+    volumes:
+      - kafka-data:/var/lib/kafka/data   # KRaft 元数据 + 消息日志；不挂卷则重建容器=丢数据
     healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      # apache/kafka 镜像的 CLI 在 /opt/kafka/bin 且不在 PATH，需全路径；Docker 镜像保留 .sh 后缀
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 30
@@ -116,3 +119,4 @@ volumes:
   mysql-data:
   es-data:
   redis-data:
+  kafka-data:
