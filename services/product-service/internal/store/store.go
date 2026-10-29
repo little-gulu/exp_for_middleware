@@ -134,7 +134,9 @@ func (s *Store) UpsertSPU(ctx context.Context, spu SPU) (int64, error) {
 	return id, nil
 }
 
-// InsertSKUs：批量多行 INSERT（一条 SQL 多组 VALUES = 一次网络往返；循环单条 = N 次往返）
+// InsertSKUs：批量多行 upsert（一条 SQL 多组 VALUES = 一次网络往返；循环单条 = N 次往返）。
+// ON DUPLICATE KEY UPDATE：SPU 被归一复用（同款重发布）时，已存在的 SKU 更新价格/库存而不是报错——
+// 今天实测踩过：SPU upsert 了但 SKU 纯 INSERT，重发同款直接撞 uk_sku 唯一键报 1062。
 func (s *Store) InsertSKUs(ctx context.Context, skus []SKU) error {
 	if len(skus) == 0 {
 		return nil
@@ -149,6 +151,7 @@ func (s *Store) InsertSKUs(ctx context.Context, skus []SKU) error {
 		b.WriteString("(?,?,?,?,?,?)")
 		args = append(args, sk.SpuID, sk.SKUCode, sk.SaleProps, sk.SaleHash, sk.Price, sk.Stock)
 	}
+	b.WriteString(" ON DUPLICATE KEY UPDATE price=VALUES(price), stock=VALUES(stock), sku_code=VALUES(sku_code)")
 	_, err := s.db.ExecContext(ctx, b.String(), args...)
 	return err
 }

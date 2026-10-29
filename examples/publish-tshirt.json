@@ -1,0 +1,13 @@
+{
+  "merchant_id": 1,
+  "client_req_id": "t-001",
+  "category_id": 211,
+  "title": "纯棉T恤 黑白款",
+  "attrs": [
+    {"attr_id": 17, "raw": "D-9999"},
+    {"attr_id": 18, "value_id": 1001},
+    {"attr_id": 18, "value_id": 1002},
+    {"attr_id": 19, "value_id": 4002},
+    {"attr_id": 19, "value_id": 4003}
+  ]
+}
