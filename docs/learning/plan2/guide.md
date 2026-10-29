@@ -127,6 +127,7 @@ Redis 的 `SETBIT key offset 1` / `GETBIT key offset` 让你把一个大 key 当
 - `h1 = fnv(id, seed1)`、`h2 = fnv(id, seed2)`（标准库 `hash/fnv`，两个不同 seed）。
 - 第 i 个哈希：`(h1 + i*h2) % m`——线性组合出 k 个"看起来独立"的值，数学上足够用。
 - 标准库 fnv 在 `hash/fnv`，`fnv.New64a()` 返回一个 `hash.Hash64`。
+- **真实踩坑（执行期实测）**：fnv 对短 key 的**低位雪崩不足**，`mod m` 取低位导致位置聚集——误判率 7.7% vs 理论 0.8%。解法：给 fnv 输出接 murmur3 `fmix64` 终结器（`bloom.go` 注释里有完整故事与代码）。这就是"哈希质量"这个边界的具体体验。
 
 ### 2.6 Pipeline：为什么值得学
 

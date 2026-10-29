@@ -1,5 +1,5 @@
 {
-  "name": "product-center-connector",
+  "name": "product-center-connector-v2",
   "config": {
     "connector.class": "io.debezium.connector.mysql.MySqlConnector",
     "database.hostname": "mysql",
@@ -10,7 +10,7 @@
     "database.include.list": "demo",
     "table.include.list": "demo.category,demo.attribute_meta,demo.spu,demo.sku",
     "topic.prefix": "demo",
-    "schema.history.internal.kafka.topic": "schema-history",
+    "schema.history.internal.kafka.topic": "schema-history-v2",
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
     "decimal.handling.mode": "double",
     "snapshot.mode": "initial",

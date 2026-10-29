@@ -32,7 +32,7 @@ func TestGenSKUsGuardrailTooManyDims(t *testing.T) {
 }
 
 func TestGenSKUsGuardrailTooManyValues(t *testing.T) {
-	dims := [][]AttrValue{{make([]AttrValue, 51)}}
+	dims := [][]AttrValue{make([]AttrValue, 51)} // 外层切片的一个元素 = 51 个零值 AttrValue 的切片
 	_, err := GenSKUs(dims)
 	if err == nil || !errors.Is(err, ErrComboExplode) {
 		t.Fatalf("单维超过 50 值应返回 ErrComboExplode, 实际 %v", err)

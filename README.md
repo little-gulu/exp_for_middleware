@@ -74,3 +74,7 @@ bash deploy/chaos.sh random     # 随机杀一个中间件，观察业务反应
 4. Debezium 默认把 DDL 事件发到 `topic=<prefix>` 这个 topic；`auto.create.topics=false` 时 producer 卡死拖垮整条管线 → `include.schema.changes=false`。
 5. 删 connector 不清 offset；同名重建不会重新快照 → 换名或清 offset。
 6. ES 的 `http.cors.allow-origin=*` 裸星号写进 elasticsearch.yml 是 YAML 别名语法，启动崩溃 → 必须带引号 `"*"`。
+7. **fnv 哈希低位雪崩不足**：布隆取 `mod m` 用的是哈希低位，fnv 对短 key 低位混合弱 → 位置聚集、误判率 7.7% vs 理论 0.8%（差 9 倍）→ 加 murmur3 fmix64 终结器后回落 0.9%。
+8. **MySQL init 脚本乱码**：docker-entrypoint 跑 init 脚本时 mysql 客户端默认 latin1，UTF-8 中文被二次编码（'型号'→'åž‹'）→ init.sql/seed.sql 顶部必须 `SET NAMES utf8mb4`；排查手段 `SELECT HEX(name)`。
+9. **struct 缺 json tag**：`encoding/json` 匹配不上 `attr_id`→`AttrID`（下划线），静默解成零值——单测全绿但接口全坏 → 字段必须有 `json:"attr_id"` tag。
+10. **spu/sku 的 id 无 AUTO_INCREMENT**：场景题原文是应用层雪花 id，demo 用数据库自增 + `LAST_INSERT_ID` 技巧 → 建表时 `id BIGINT PRIMARY KEY AUTO_INCREMENT`。

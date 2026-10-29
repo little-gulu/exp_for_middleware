@@ -17,13 +17,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"sort"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
-
-// 实现 genCategory 时需要补的 import：math/rand（随机品牌/价格/库存）、time（随机种子）
 
 const dsn = "root:root123456@tcp(localhost:13306)/demo?charset=utf8mb4&parseTime=true"
 
@@ -80,25 +80,110 @@ func main() {
 	log.Printf("造数完成：目标 SPU=%d", *products)
 }
 
-// genCategory：对一个类目生成 count 个 SPU + 其全部 SKU。
-//
-// TODO 你的实现（骨架和思路如下）：
-//   1. loadMetas 读该类目 key/sale 属性（函数在下方，已给）
-//   2. 建品牌"文本→vid"映射（枚举在 attribute_meta 的 enum_values 里）
-//   3. 循环 count 次，每次：
-//      a. 随机挑 brand + model；关键属性拼 keyVals map（enum 用 vid、string 用 model 文本）
-//      b. keyHash := keyHashOf(categoryID, keyVals)（已给）；title = brand+" "+model+" "+Suffix
-//      c. spuID 自增；spuBuf 追加一行 "(1,{cat},'{title}','{keyProps}','{}','{keyHash}',NOW())"
-//      d. 销售属性枚举笛卡尔积（双层循环展开，或递归）→ 每个组合拼 saleVals map
-//      e. skuBuf 追加 "(spuID,'SKU-G-{n}','{saleProps}','{saleHash}',{price},{stock})"
-//         price = PriceBase + 随机 0~3000；stock = 随机 0~500
-//   4. spuBuf 满 batch 行 → flush() 两条批量 INSERT（spu 一条、sku 一条）→ 清空缓冲 + 进度日志
-//   5. 循环结束再 flush 一次（尾巴）
-//   提示：
-//     - esc() 把单引号转义（标题可能含单引号）
-//     - 每批先插 spu 再插 sku（sku.spu_id 引用 spu.id——顺序反了会外键错乱/孤儿行）
+// genCategory：对一个类目生成 count 个 SPU + 其全部 SKU（批量多行 INSERT）。
 func genCategory(ctx context.Context, db *sql.DB, t catTemplate, count, batch int) error {
-	panic("TODO: 你的实现")
+	metas, err := loadMetas(ctx, db, t.CategoryID)
+	if err != nil {
+		return err
+	}
+	var keyMetas, saleMetas []attrMeta
+	for _, m := range metas {
+		if m.IsKey {
+			keyMetas = append(keyMetas, m)
+		}
+		if m.IsSale {
+			saleMetas = append(saleMetas, m)
+		}
+	}
+
+	// 品牌枚举的文本→vid 映射（key 属性里的枚举就是品牌）
+	textToVID := map[string]int64{}
+	for _, m := range metas {
+		for _, e := range m.Enums {
+			textToVID[e.Text] = e.VID
+		}
+	}
+
+	spuBuf := make([]string, 0, batch)
+	skuBuf := make([]string, 0, batch)
+	spuID, skuCode, totalSPU := int64(0), int64(0), 0
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// flush：两条批量 INSERT（先 spu 后 sku——sku.spu_id 引用 spu.id）
+	flush := func() error {
+		if len(spuBuf) == 0 {
+			return nil
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO spu (merchant_id,category_id,title,key_props,base_props,key_hash,publish_time) VALUES "+strings.Join(spuBuf, ",")); err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx,
+			"INSERT INTO sku (spu_id,sku_code,sale_props,sale_hash,price,stock) VALUES "+strings.Join(skuBuf, ",")); err != nil {
+			return err
+		}
+		spuBuf, skuBuf = spuBuf[:0], skuBuf[:0]
+		return nil
+	}
+
+	for i := 0; i < count; i++ {
+		brand := t.Brands[rng.Intn(len(t.Brands))]
+		model := t.Models[rng.Intn(len(t.Models))]
+
+		// 关键属性：enum（品牌）用 vid，string（型号/款号）用文本
+		keyVals := map[int64]string{}
+		for _, m := range keyMetas {
+			if m.ValueType == "enum" {
+				keyVals[m.ID] = fmt.Sprintf("%d", textToVID[brand])
+			} else {
+				keyVals[m.ID] = model
+			}
+		}
+		keyHash := keyHashOf(t.CategoryID, keyVals)
+		keyProps, _ := json.Marshal(keyVals)
+		title := brand + " " + model + " " + t.Suffix
+
+		spuID++
+		spuBuf = append(spuBuf, fmt.Sprintf("(1,%d,'%s','%s','{}','%s',NOW())",
+			t.CategoryID, esc(title), esc(string(keyProps)), keyHash))
+
+		// 销售属性枚举笛卡尔积
+		combos := [][]enumVal{{}}
+		for _, m := range saleMetas {
+			var next [][]enumVal
+			for _, c := range combos {
+				for _, e := range m.Enums {
+					next = append(next, append(append([]enumVal(nil), c...), e))
+				}
+			}
+			combos = next
+		}
+		for _, combo := range combos {
+			saleVals := map[int64]string{}
+			for i, m := range saleMetas {
+				saleVals[m.ID] = fmt.Sprintf("%d", combo[i].VID)
+			}
+			saleHash := keyHashOf(0, saleVals)
+			saleProps, _ := json.Marshal(saleVals)
+			skuCode++
+			skuBuf = append(skuBuf, fmt.Sprintf("(%d,'SKU-G-%d','%s','%s',%.2f,%d)",
+				spuID, skuCode, esc(string(saleProps)), saleHash,
+				t.PriceBase+float64(rng.Intn(3000)), rng.Intn(500)))
+		}
+
+		totalSPU++
+		if len(spuBuf) >= batch {
+			if err := flush(); err != nil {
+				return err
+			}
+			log.Printf("类目 %d：已生成 %d SPU", t.CategoryID, totalSPU)
+		}
+	}
+	if err := flush(); err != nil {
+		return err
+	}
+	log.Printf("类目 %d 完成：SPU=%d", t.CategoryID, totalSPU)
+	return nil
 }
 
 // keyHashOf：与 product-service 相同的指纹算法（独立 module，按约定复制一份）

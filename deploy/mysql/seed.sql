@@ -1,5 +1,7 @@
 -- 种子数据：类目树 + 属性元数据 + 枚举值（真实实体，load-gen 按此模板造数）
 -- 枚举 vid 全局唯一：值用 vid 存、文本仅展示（改名不影响倒排——bug B7 的正确基线）
+-- ★ 同 init.sql：必须 SET NAMES utf8mb4，否则中文二次编码成乱码
+SET NAMES utf8mb4;
 
 -- 类目树（3 层，8 个叶子类目）
 INSERT INTO category (id, parent_id, name, level, path, is_leaf) VALUES

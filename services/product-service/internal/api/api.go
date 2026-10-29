@@ -5,8 +5,13 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"math/rand"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -14,10 +19,6 @@ import (
 	"product-service/internal/publish"
 	"product-service/internal/store"
 )
-
-// 实现 TODO 时需要补的 import：
-//   fmt（sku_code/缓存 key 拼接）、log（布隆置位失败日志）、
-//   math/rand（缓存 TTL 随机偏移）、time（TTL 计算）
 
 const (
 	bloomM = 9600000 // 布隆位数组长度（n=10^6, p=1% 反推：m = -n·ln(p)/(ln2)²）
@@ -83,34 +84,158 @@ type PublishResp struct {
 	Duplicate bool  `json:"duplicate"`
 }
 
-// Publish：POST /publish —— 发布一个商品，7 步流程。
-//
-// TODO 你的实现（按注释骨架补全每一步）：
-//   ① 解析请求体（json.NewDecoder(r.Body).Decode(&req)）；ClientReqID 为空 → 400
-//   ② 幂等抢占：TryAcquire 失败 → GetResult 取首次 spu_id → 返回 {spu_id, duplicate:true}
-//   ③ 拉类目模板：GetCategoryMetas；空 → 400 "类目不存在或无属性模板"
-//   ④ 校验：publish.Validate(metas, req.Attrs)；失败 → 400（错误信息带属性名）
-//   ⑤ 归类：publish.GroupByAttrID(req.Attrs) → 按 m.IsKey/m.IsSale/其它 分成 keyVals/baseVals/saleDims
-//   ⑥ SPU 归一：publish.KeyHash(categoryID, keyVals) → UpsertSPU
-//   ⑦ SKU：publish.GenSKUs(saleDims)（护栏在函数内）→ 每个组合 sale_hash=KeyHash(0, combo) → InsertSKUs
-//   ⑧ 布隆置位：filter.Add(spuID)——失败只打日志不阻塞（布隆是优化，降级可接受）
-//   ⑨ SetResult + 返回 {spu_id, sku_count, duplicate:false}
-//   提示：
-//     - ctx := r.Context() 一路透传（取消/超时会顺 ctx 传导到 DB/Redis）
-//     - 错误分类：errors.Is(err, publish.ErrRequired) → 400；其余按 500 处理
+// Publish：POST /publish —— 发布一个商品，7 步流程：
+// ① 幂等抢占 → ② 拉类目模板 → ③ 元数据校验 → ④ 属性归类 → ⑤ SPU 归一落库
+// → ⑥ SKU 笛卡尔积落库 → ⑦ 布隆置位 + 记录结果
 func (srv *Server) Publish(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: 你的实现")
+	ctx := r.Context() // 透传：取消/超时会顺 ctx 传导到 DB/Redis
+
+	var req PublishReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	if req.ClientReqID == "" {
+		writeErr(w, http.StatusBadRequest, "client_req_id 必填（发布幂等的凭据）")
+		return
+	}
+
+	// ① 幂等：抢不到标记=重复请求 → 返回首次结果（防网络重试重复生成 SKU，bug 卡 B4）
+	if ok, err := srv.idem.TryAcquire(ctx, req.MerchantID, req.ClientReqID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "幂等检查失败: "+err.Error())
+		return
+	} else if !ok {
+		spuID, err := srv.idem.GetResult(ctx, req.MerchantID, req.ClientReqID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "查询首次结果失败: "+err.Error())
+			return
+		}
+		writeJSON(w, PublishResp{SPUID: spuID, Duplicate: true})
+		return
+	}
+
+	// ② 拉该类目属性模板
+	metas, err := srv.store.GetCategoryMetas(ctx, req.CategoryID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读取类目属性失败: "+err.Error())
+		return
+	}
+	if len(metas) == 0 {
+		writeErr(w, http.StatusBadRequest, "类目不存在或无属性模板")
+		return
+	}
+
+	// ③ 元数据驱动校验（错误分类：哨兵 → 400）
+	if err := publish.Validate(metas, req.Attrs); err != nil {
+		if errors.Is(err, publish.ErrRequired) || errors.Is(err, publish.ErrIllegalEnum) || errors.Is(err, publish.ErrInvalidType) {
+			writeErr(w, http.StatusBadRequest, "属性校验失败: "+err.Error())
+		} else {
+			writeErr(w, http.StatusInternalServerError, "属性校验失败: "+err.Error())
+		}
+		return
+	}
+
+	// ④ 按元数据分类：关键属性→归一；销售属性→笛卡尔积维度；其它→普通属性
+	grouped := publish.GroupByAttrID(req.Attrs)
+	var keyVals, baseVals []publish.AttrValue
+	var saleDims [][]publish.AttrValue
+	for _, m := range metas {
+		vals := grouped[m.ID]
+		switch {
+		case m.IsKey:
+			keyVals = append(keyVals, vals...)
+		case m.IsSale:
+			saleDims = append(saleDims, vals)
+		case len(vals) > 0:
+			baseVals = append(baseVals, vals[0])
+		}
+	}
+
+	// ⑤ SPU 归一落库（撞唯一键=同款 → 复用已有行）
+	keyHash := publish.KeyHash(req.CategoryID, keyVals)
+	spuID, err := srv.store.UpsertSPU(ctx, store.SPU{
+		MerchantID: req.MerchantID,
+		CategoryID: req.CategoryID,
+		Title:      req.Title,
+		KeyProps:   propsJSON(keyVals),
+		BaseProps:  propsJSON(baseVals),
+		KeyHash:    keyHash,
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "SPU 落库失败: "+err.Error())
+		return
+	}
+
+	// ⑥ SKU 笛卡尔积（护栏在 GenSKUs 内，bug 卡 B6）+ 批量落库
+	combos, err := publish.GenSKUs(saleDims)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	skus := make([]store.SKU, 0, len(combos))
+	for _, combo := range combos {
+		saleHash := publish.KeyHash(0, combo) // 同套指纹规则
+		skus = append(skus, store.SKU{
+			SpuID:     spuID,
+			SKUCode:   fmt.Sprintf("SKU-%d-%s", spuID, saleHash[:8]),
+			SaleProps: propsJSON(combo),
+			SaleHash:  saleHash,
+			Price:     99.00, // demo 默认值；真实场景由商家提交
+			Stock:     100,
+		})
+	}
+	if err := srv.store.InsertSKUs(ctx, skus); err != nil {
+		writeErr(w, http.StatusInternalServerError, "SKU 落库失败: "+err.Error())
+		return
+	}
+
+	// ⑦ 布隆置位（失败只打日志——布隆是优化，不是主流程的命脉，降级可接受）
+	if err := srv.filter.Add(ctx, spuID); err != nil {
+		log.Printf("布隆置位失败 spu=%d: %v（不影响发布主流程）", spuID, err)
+	}
+
+	_ = srv.idem.SetResult(ctx, req.MerchantID, req.ClientReqID, spuID)
+	writeJSON(w, PublishResp{SPUID: spuID, SKUCount: len(skus)})
 }
 
 // Detail：GET /spu/{id} —— 三级读路径：布隆 → 缓存 → 回源。
-//
-// TODO 你的实现（按注释骨架补全）：
-//   ① r.PathValue("id") + strconv.ParseInt 拿 spuID；非法 → 400
-//   ② 布隆：MayContain=false → 404（防大量不存在 ID 打穿 MySQL——bug 卡 R1）
-//   ③ Redis 缓存 spu:{id}：命中 → 响应头 X-Cache: hit → 原样写回
-//   ④ 回源：GetSPUWithSKUs；nil → 404；err → 500
-//   ⑤ 写缓存：TTL = 10*time.Minute + 随机 0~3min（加随机偏移防齐过期——bug 卡 R3）→ X-Cache: miss 返回
-//   提示：缓存 value 用 json.Marshal(d) 的字节串
 func (srv *Server) Detail(w http.ResponseWriter, r *http.Request) {
-	panic("TODO: 你的实现")
+	ctx := r.Context()
+	spuID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "非法商品 id")
+		return
+	}
+
+	// ① 布隆拦截：肯定不存在 → 404（防大量不存在 ID 打穿 MySQL，bug 卡 R1）
+	if ok, err := srv.filter.MayContain(ctx, spuID); err == nil && !ok {
+		writeErr(w, http.StatusNotFound, "商品不存在")
+		return
+	}
+
+	// ② 缓存命中直接回
+	ckey := fmt.Sprintf("spu:%d", spuID)
+	if v, err := srv.rdb.Get(ctx, ckey).Result(); err == nil {
+		w.Header().Set("X-Cache", "hit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(v))
+		return
+	}
+
+	// ③ 回源 MySQL + 写缓存（TTL 加随机偏移防齐过期，bug 卡 R3）
+	d, err := srv.store.GetSPUWithSKUs(ctx, spuID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "查询失败: "+err.Error())
+		return
+	}
+	if d == nil {
+		writeErr(w, http.StatusNotFound, "商品不存在")
+		return
+	}
+	b, _ := json.Marshal(d)
+	ttl := 10*time.Minute + time.Duration(rand.Int63n(int64(3*time.Minute))) // 10min ± 3min 随机
+	_ = srv.rdb.Set(ctx, ckey, b, ttl)
+	w.Header().Set("X-Cache", "miss")
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(b)
 }

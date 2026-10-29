@@ -6,5 +6,9 @@ package publish
 //
 // TODO 你的实现：一次遍历 + map[int64][]AttrValue 即可（约 5 行）。
 func GroupByAttrID(attrs []AttrValue) map[int64][]AttrValue {
-	panic("TODO: 你的实现")
+	grouped := make(map[int64][]AttrValue)
+	for _, a := range attrs {
+		grouped[a.AttrID] = append(grouped[a.AttrID], a)
+	}
+	return grouped
 }

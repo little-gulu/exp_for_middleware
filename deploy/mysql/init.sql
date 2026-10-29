@@ -1,6 +1,10 @@
 -- 建表 + Debezium 复制账号（只在数据卷首次初始化时执行）
 -- 表结构 = spec §4.1，逐列注释"为什么"：
 
+-- ★ 必须显式指定连接字符集：docker-entrypoint 执行 init 脚本时 mysql 客户端默认 latin1，
+--   会把 UTF-8 中文二次编码成乱码（今天实测踩过：'型号' 存成了 'åž‹'）——排查手段：SELECT HEX(name)
+SET NAMES utf8mb4;
+
 CREATE TABLE category (
   id        BIGINT PRIMARY KEY,
   parent_id BIGINT NOT NULL DEFAULT 0,
@@ -33,8 +37,9 @@ CREATE TABLE attribute_meta (
 ) ENGINE=InnoDB;
 
 -- SPU：标准化产品。JSON 存属性快照（只存不查，bug M6）；price 不在这层（在 SKU）
+-- id 用 AUTO_INCREMENT：demo 简化（生产用雪花算法应用层生成分布式 id，见场景题）
 CREATE TABLE spu (
-  id           BIGINT PRIMARY KEY,
+  id           BIGINT PRIMARY KEY AUTO_INCREMENT,
   merchant_id  BIGINT NOT NULL DEFAULT 1,  -- 商家维度；唯一键带 merchant 防 bug B5（多商家卖同款撞键）
   category_id  BIGINT NOT NULL,
   brand_id     BIGINT NOT NULL DEFAULT 0,
@@ -51,7 +56,7 @@ CREATE TABLE spu (
 
 -- SKU：可售卖最小单元。price/stock 留关系列=交易强一致（塞 JSON 就废了）
 CREATE TABLE sku (
-  id           BIGINT PRIMARY KEY,
+  id           BIGINT PRIMARY KEY AUTO_INCREMENT,
   spu_id       BIGINT NOT NULL,
   sku_code     VARCHAR(64) NOT NULL,
   sale_props   JSON NOT NULL,              -- {"颜色":1001,"尺码":4002}，值用 vid（bug B7）

@@ -5,13 +5,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
-
-// 实现 TODO 时需要补的 import：encoding/json（enum_values 解析）、strings（批量 INSERT 拼接）
 
 // EnumVal / AttributeMeta：attribute_meta 表一行的 Go 形态（供 publish 包消费）
 type EnumVal struct {
@@ -82,53 +82,103 @@ func NewStore(dsn string) (*Store, error) {
 }
 
 // GetCategoryMetas：拉某类目的全部属性模板（发布校验的输入）。
-//
-// TODO 你的实现（SQL 已给，练的是 Go 侧）：
-//   SELECT id, category_id, name, value_type, is_key, is_sale, is_search, is_filter, required, enum_values, IFNULL(unit,'')
-//   FROM attribute_meta WHERE category_id = ? ORDER BY sort_order, id
-//   提示：
-//     1. QueryContext 拿 rows，defer rows.Close()（必须！）
-//     2. Scan 顺序必须与 SELECT 列序一致；TINYINT 扫进 int（1/0），再转 bool（m.IsKey = isKey == 1）
-//     3. enum_values 是 JSON 列 → 扫进 []byte → json.Unmarshal 进 []EnumVal（可能为 NULL，len==0 跳过）
-//     4. 最后 return metas, rows.Err()（rows.Err 捕获迭代中途的错误，别漏）
 func (s *Store) GetCategoryMetas(ctx context.Context, categoryID int64) ([]AttributeMeta, error) {
-	panic("TODO: 你的实现")
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, category_id, name, value_type, is_key, is_sale, is_search, is_filter, required, enum_values, IFNULL(unit,'')
+		 FROM attribute_meta WHERE category_id = ? ORDER BY sort_order, id`, categoryID)
+	if err != nil {
+		return nil, fmt.Errorf("query attribute_meta: %w", err)
+	}
+	defer rows.Close()
+
+	var metas []AttributeMeta
+	for rows.Next() {
+		var m AttributeMeta
+		var isKey, isSale, isSearch, isFilter, required int
+		var enumJSON []byte
+		if err := rows.Scan(&m.ID, &m.CategoryID, &m.Name, &m.ValueType,
+			&isKey, &isSale, &isSearch, &isFilter, &required, &enumJSON, &m.Unit); err != nil {
+			return nil, fmt.Errorf("scan attribute_meta: %w", err)
+		}
+		m.IsKey = isKey == 1 // TINYINT → bool
+		m.IsSale = isSale == 1
+		m.IsSearch = isSearch == 1
+		m.IsFilter = isFilter == 1
+		m.Required = required == 1
+		if len(enumJSON) > 0 {
+			if err := json.Unmarshal(enumJSON, &m.EnumValues); err != nil {
+				return nil, fmt.Errorf("unmarshal enum_values: %w", err)
+			}
+		}
+		metas = append(metas, m)
+	}
+	return metas, rows.Err()
 }
 
 // UpsertSPU：SPU 归一落库（业务背景：同款复用不重复建）。
-//
-// TODO 你的实现（SQL 已给，体会这个技巧）：
-//   INSERT INTO spu (merchant_id, category_id, title, key_props, base_props, key_hash, publish_time)
-//   VALUES (?, ?, ?, ?, ?, ?, NOW())
-//   ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), title = VALUES(title)
-//   然后 SELECT LAST_INSERT_ID() 拿 id 并返回。
-//   提示：撞唯一键 (merchant_id, category_id, key_hash) 时不是报错，
-//         而是更新并让 LAST_INSERT_ID() 返回"已存在那行"的 id——一行 SQL 实现"新建或复用"。
+// 撞唯一键 (merchant_id, category_id, key_hash) 时不是报错，
+// 而是更新并让 LAST_INSERT_ID() 返回"已存在那行"的 id——一行 SQL 实现"新建或复用"。
 func (s *Store) UpsertSPU(ctx context.Context, spu SPU) (int64, error) {
-	panic("TODO: 你的实现")
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO spu (merchant_id, category_id, title, key_props, base_props, key_hash, publish_time)
+		VALUES (?, ?, ?, ?, ?, ?, NOW())
+		ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), title = VALUES(title)`,
+		spu.MerchantID, spu.CategoryID, spu.Title, spu.KeyProps, spu.BaseProps, spu.KeyHash)
+	if err != nil {
+		return 0, fmt.Errorf("upsert spu: %w", err)
+	}
+	var id int64
+	if err := s.db.QueryRowContext(ctx, "SELECT LAST_INSERT_ID()").Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
-// InsertSKUs：批量多行 INSERT。
-//
-// TODO 你的实现：
-//   INSERT INTO sku (spu_id, sku_code, sale_props, sale_hash, price, stock) VALUES (?,?,?,?,?,?),(?,?,?,?,?,?),...
-//   提示：
-//     1. strings.Builder 拼 "VALUES " + 逗号连接的 "(?,?,?,?,?,?)"
-//     2. args 切片按顺序 append 6 个值/行，占位符个数必须与值数一致
-//     3. 一条 SQL 塞 N 组 VALUES = 一次网络往返；循环单条 INSERT = N 次往返——百万行造数的唯一可行路径
+// InsertSKUs：批量多行 INSERT（一条 SQL 多组 VALUES = 一次网络往返；循环单条 = N 次往返）
 func (s *Store) InsertSKUs(ctx context.Context, skus []SKU) error {
-	panic("TODO: 你的实现")
+	if len(skus) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("INSERT INTO sku (spu_id, sku_code, sale_props, sale_hash, price, stock) VALUES ")
+	args := make([]any, 0, len(skus)*6)
+	for i, sk := range skus {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?,?,?,?,?,?)")
+		args = append(args, sk.SpuID, sk.SKUCode, sk.SaleProps, sk.SaleHash, sk.Price, sk.Stock)
+	}
+	_, err := s.db.ExecContext(ctx, b.String(), args...)
+	return err
 }
 
-// GetSPUWithSKUs：SPU + 它的 SKU 列表。
-//
-// TODO 你的实现：
-//   1. QueryRow 查 spu：SELECT id, merchant_id, category_id, title, key_props, base_props, key_hash FROM spu WHERE id=?
-//      err == sql.ErrNoRows → return (nil, nil)（不存在不是错误）
-//   2. Query 查 sku：SELECT spu_id, sku_code, sale_props, sale_hash, price, stock FROM sku WHERE spu_id=?
-//   3. return &d, rows.Err()
+// GetSPUWithSKUs：SPU + 它的 SKU 列表；不存在返回 (nil, nil)。
 func (s *Store) GetSPUWithSKUs(ctx context.Context, spuID int64) (*SPUDetail, error) {
-	panic("TODO: 你的实现")
+	var d SPUDetail
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, merchant_id, category_id, title, key_props, base_props, key_hash FROM spu WHERE id=?`, spuID).
+		Scan(&d.ID, &d.MerchantID, &d.CategoryID, &d.Title, &d.KeyProps, &d.BaseProps, &d.KeyHash)
+	if err == sql.ErrNoRows {
+		return nil, nil // 不存在不是错误
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT spu_id, sku_code, sale_props, sale_hash, price, stock FROM sku WHERE spu_id=?`, spuID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sk SKU
+		if err := rows.Scan(&sk.SpuID, &sk.SKUCode, &sk.SaleProps, &sk.SaleHash, &sk.Price, &sk.Stock); err != nil {
+			return nil, err
+		}
+		d.SKUs = append(d.SKUs, sk)
+	}
+	return &d, rows.Err()
 }
 
 // Close：进程退出时释放连接池
